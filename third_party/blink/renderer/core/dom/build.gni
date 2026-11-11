@@ -280,6 +280,8 @@ blink_core_sources_dom = [
   "static_node_list.h",
   "static_range.cc",
   "static_range.h",
+  "shared_observable.cc",
+  "shared_observable.h",
   "subscriber.cc",
   "subscriber.h",
   "tag_collection.cc",
@@ -358,3 +360,4 @@ blink_core_tests_dom = [
   "weak_identifier_map_test.cc",
   "whitespace_attacher_test.cc",
 ]
+

@@ -1,0 +1,20 @@
+// Copyright 2026 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// https://github.com/WICG/observable/pull/222
+dictionary SharedObservableConfig : ObservableConfig {
+  any maxReplayValues;
+  boolean closeOnComplete;
+  boolean closeOnError;
+  boolean closeOnLastUnsubscribe;
+  boolean keepAliveOnLastUnsubscribe;
+};
+
+[Exposed=(Window,Worker,ShadowRealm)]
+interface SharedObservable : Observable {
+  [CallWith=ScriptState, RaisesException] constructor((SubscribeCallback or SharedObservableConfig) producer);
+  readonly attribute unsigned long long activeSubscribers;
+  readonly attribute FrozenArray<any> replayValues;
+  readonly attribute unsigned long long maxReplayValues;
+};

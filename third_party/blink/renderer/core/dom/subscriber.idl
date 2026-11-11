@@ -4,14 +4,19 @@
 
 // https://github.com/WICG/observable
 
+dictionary TerminationConfig {
+  boolean close = false;
+};
+
 [Exposed=(Window,Worker,ShadowRealm)] // TODO(crbug.com/40282760): This should be Exposed=*
 interface Subscriber {
   void next(any result);
-  [CallWith=ScriptState] void error(any error);
-  [CallWith=ScriptState] void complete();
+  [CallWith=ScriptState] void error(any error, optional TerminationConfig config = {});
+  [CallWith=ScriptState] void complete(optional TerminationConfig config = {});
   void addTeardown(VoidFunction teardown);
 
   readonly attribute boolean active;
   readonly attribute AbortSignal signal;
 };
+
 

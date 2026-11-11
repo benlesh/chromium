@@ -82,8 +82,7 @@ v8::Local<v8::Function> V8ObjectConstructor::CreateInterfaceObject(
   v8::Local<v8::Function> interface_object =
       interface_template->GetFunction(context).ToLocalChecked();
 
-  if (type->parent_class) {
-    DCHECK(!parent_interface.IsEmpty());
+  if (!parent_interface.IsEmpty()) {
     interface_object->SetPrototype(context, parent_interface).Check();
   }
 
@@ -107,3 +106,4 @@ v8::Local<v8::Function> V8ObjectConstructor::CreateInterfaceObject(
 }
 
 }  // namespace blink
+

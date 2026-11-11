@@ -22,6 +22,8 @@ class ObservableInternalObserver;
 class Observable;
 class ScriptState;
 class SubscribeOptions;
+class SharedObservable;
+class TerminationConfig;
 class V8VoidFunction;
 
 class CORE_EXPORT Subscriber final : public ScriptWrappable,
@@ -32,12 +34,13 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   Subscriber(base::PassKey<Observable>,
              ScriptState*,
              ObservableInternalObserver*,
-             SubscribeOptions*);
+             SubscribeOptions*,
+             SharedObservable* = nullptr);
 
   // API methods.
   void next(ScriptValue);
-  void complete(ScriptState*);
-  void error(ScriptState*, ScriptValue);
+  void complete(ScriptState*, const TerminationConfig* = nullptr);
+  void error(ScriptState*, ScriptValue, const TerminationConfig* = nullptr);
   void addTeardown(V8VoidFunction*);
 
   // API attributes.
@@ -48,6 +51,8 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
                            ObservableInternalObserver*,
                            SubscribeOptions*);
 
+  uint64_t ObserverCount() const { return internal_observers_.size(); }
+  void ReplayTo(ObservableInternalObserver*, const HeapVector<ScriptValue>&);
   void Trace(Visitor*) const override;
 
  private:
@@ -76,7 +81,10 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   //      producer error is communicated through to `this`'s signal and any
   //      upstream signals.
   void CloseSubscription(ScriptState* script_state,
-                         std::optional<ScriptValue> abort_reason);
+                         std::optional<ScriptValue> abort_reason,
+                         bool terminal = false,
+                         bool is_error = false,
+                         bool close = false);
 
   // The list of `ObservableInternalObserver`s which encapsulate algorithms to
   // call when `this` produces values or actions that need to be pushed to the
@@ -108,6 +116,7 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   // are invoked) or once the subscriber unsubscribes by aborting the
   // `AbortSignal` that it passed into `Observable::subscribe()`.
   bool active_ = true;
+  Member<SharedObservable> shared_owner_;
 
   // `subscription_controller_` is aborted in two cases:
   //   1. Producer-initiated unsubscription: when `error()`/`complete()` are
@@ -127,3 +136,4 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
 }  // namespace blink
 
 #endif  // THIRD_PARTY_BLINK_RENDERER_CORE_DOM_SUBSCRIBER_H_
+
