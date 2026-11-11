@@ -261,6 +261,7 @@ def _build_supported_extended_attributes():
         E("SaveSameObject", applicable_to=[T.ATTRIBUTE]),
         E("SecureContext", applicable_to=T_EXPOSURE),
         E("Serializable", applicable_to=[T.INTERFACE]),
+        E("SkipInInterfaceObjectPrototypeChain", applicable_to=[T.INTERFACE]),
         E(
             "SetterCallWith",
             applicable_to=[T.ATTRIBUTE],

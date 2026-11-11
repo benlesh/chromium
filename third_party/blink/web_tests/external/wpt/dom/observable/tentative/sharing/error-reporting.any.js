@@ -78,3 +78,28 @@ promise_test(async t => {
   await reported;
   assert_array_equals(log, ["second", "first", "complete"]);
 }, "A throwing shared teardown does not suppress remaining cleanup or completion");
+
+promise_test(async t => {
+  const reported = [];
+  const listener = t.step_func(event => {
+    event.preventDefault();
+    reported.push(event.error);
+  });
+  self.addEventListener("error", listener);
+  t.add_cleanup(() => self.removeEventListener("error", listener));
+  const stop = new AbortController();
+  const delivered = [];
+  new Observable(s => s.error("recover"))
+    .catch(() => {
+      stop.abort();
+      return 42;
+    })
+    .subscribe({
+      next: value => delivered.push(value),
+      error: error => delivered.push(error),
+      complete: () => delivered.push("complete"),
+    }, {signal: stop.signal});
+  await new Promise(resolve => t.step_timeout(resolve, 0));
+  assert_array_equals(delivered, []);
+  assert_array_equals(reported, [], "Canceled recovery must not convert its return value");
+}, "catch() does not convert or report an invalid recovery value after its callback cancels the consumer");

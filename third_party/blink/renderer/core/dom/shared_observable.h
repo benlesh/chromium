@@ -5,11 +5,13 @@
 #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_DOM_SHARED_OBSERVABLE_H_
 #define THIRD_PARTY_BLINK_RENDERER_CORE_DOM_SHARED_OBSERVABLE_H_
 
+#include <optional>
+
 #include "third_party/blink/renderer/core/dom/observable.h"
 
 namespace blink {
 
-class AbortSignal;
+struct IDLAny;
 class V8UnionSharedObservableConfigOrSubscribeCallback;
 
 class CORE_EXPORT SharedObservable final : public Observable {
@@ -39,11 +41,11 @@ class CORE_EXPORT SharedObservable final : public Observable {
   SharedObservable* AsSharedObservable() override { return this; }
 
   uint64_t activeSubscribers() const;
-  HeapVector<ScriptValue> replayValues() const;
+  const FrozenArray<IDLAny>* replayValues() const;
   uint64_t maxReplayValues() const { return settings_.max_replay_values; }
 
   void SubscribeShared(ScriptState*,
-                       ObservableInternalObserver*,
+                       ObservableSubscriptionObserver*,
                        SubscribeOptions*);
   void RecordNext(Subscriber*, ScriptValue);
   void EndExecution(Subscriber*,
@@ -56,6 +58,8 @@ class CORE_EXPORT SharedObservable final : public Observable {
   void Trace(Visitor*) const override;
 
  private:
+  HeapVector<ScriptValue> ReplaySnapshot() const;
+
   enum class Terminal { kNone, kComplete, kError };
 
   const Settings settings_;

@@ -8212,7 +8212,7 @@ const WrapperTypeInfo ${class_name}::wrapper_type_info_{{
         assert False
     is_skipped_in_interface_object_prototype_chain = (
         "true"
-        if class_like.identifier in ("WindowProperties", "Observable")
+        if "SkipInInterfaceObjectPrototypeChain" in class_like.extended_attributes
         else "false"
     )
     wrapper_type_info_def.append(
@@ -9664,4 +9664,3 @@ def generate_interfaces(task_queue):
         "init_idl_interfaces_for_testing",
         for_testing=True,
     )
-

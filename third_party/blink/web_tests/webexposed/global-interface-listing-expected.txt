@@ -7346,26 +7346,20 @@ interface OTPCredential : Credential
 interface Observable
     static method from
     attribute @@toStringTag
+    getter sharedSources
     method catch
     method constructor
     method drop
-    method every
     method filter
     method finally
-    method find
-    method first
     method flatMap
-    method forEach
     method inspect
-    method last
     method map
-    method reduce
-    method some
+    method share
     method subscribe
     method switchMap
     method take
     method takeUntil
-    method toArray
 interface OfflineAudioCompletionEvent : Event
     attribute @@toStringTag
     getter renderedBuffer
@@ -10271,6 +10265,12 @@ interface ShapedText
     method glyphRuns
     method positionToAdvance
     method selectionRects
+interface SharedObservable
+    attribute @@toStringTag
+    getter activeSubscribers
+    getter maxReplayValues
+    getter replayValues
+    method constructor
 interface SharedWorker : EventTarget
     attribute @@toStringTag
     getter onerror
@@ -14319,4 +14319,3 @@ namespace console
 PASS successfullyParsed is true
 
 TEST COMPLETE
-

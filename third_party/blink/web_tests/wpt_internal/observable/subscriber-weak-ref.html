@@ -1,43 +1,60 @@
 <!DOCTYPE html>
+<title>Ordinary and shared Observable execution retention</title>
 <script src="/resources/testharness.js"></script>
 <script src="/resources/testharnessreport.js"></script>
-<body>
 <script>
-// This test ensures that `Subscriber` is not an `ActiveScriptWrappable`, whose
-// lifetime defies usual garbage collection semantics for weakly-referenced
-// objects.
-promise_test(async t => {
-  let strong_observable = null;
-  let weak_subscriber = null;
-
-  const results = [];
-  {
-    // Create a new Observable, subscribe to it, and throw it out.
-    strong_observable = new Observable(subscriber => {
-      results.push('new subscription');
-      weak_subscriber = new WeakRef(subscriber);
-    });
-    // Subscribe to start the subscription and make `weak_subscriber` "active",
-    // but we don't need any handlers.
-    strong_observable.subscribe();
-  }
-
-  assert_true(strong_observable instanceof Observable);
-  assert_true(weak_subscriber.deref() instanceof Subscriber);
-  // Trigger garbage collection, and verify that `weak_subscriber` has been
-  // garbage collected despite the fact that it was "active".
+async function collectAfterCurrentJob(t) {
+  // WeakRef.deref() keeps its target alive until the current job finishes.
+  await new Promise(resolve => t.step_timeout(resolve, 0));
   await gc({type: 'major', execution: 'async'});
-  assert_equals(weak_subscriber.deref(), undefined);
+}
 
-  // `strong_observable` detects that its associated "weak subscriber" [1] has
-  // been garbage collected and is null, so that subsequent subscriptions can
-  // start anew.
-  // [1]: https://wicg.github.io/observable/#observable-weak-subscriber.
-  strong_observable.subscribe();
-  assert_true(weak_subscriber.deref() instanceof Subscriber);
-  assert_array_equals(results, ['new subscription', 'new subscription']);
-}, "Subscriber is not arbitrarily kept alive until the subscription ends, " +
-   "but can be garbage collected if it is weakly owned throughout the " +
-   "subscription");
+promise_test(async t => {
+  const weak = [];
+  const observable = new Observable(s => weak.push(new WeakRef(s)));
+  observable.subscribe();
+  observable.subscribe();
+  assert_equals(weak.length, 2);
+  assert_not_equals(weak[0].deref(), weak[1].deref(),
+                    'Ordinary subscriptions are independent even before GC');
+  await collectAfterCurrentJob(t);
+  assert_equals(weak[0].deref(), undefined);
+  assert_equals(weak[1].deref(), undefined);
+  observable.subscribe();
+  assert_equals(weak.length, 3);
+  assert_true(weak[2].deref() instanceof Subscriber);
+}, 'An ordinary Observable does not retain otherwise unreachable executions');
+
+promise_test(async t => {
+  const weak = [];
+  const shared = new SharedObservable({
+    producer: s => weak.push(new WeakRef(s)),
+    keepAliveOnLastUnsubscribe: true,
+  });
+  t.add_cleanup(() => weak[0].deref()?.complete());
+  const first = new AbortController();
+  shared.subscribe({}, {signal: first.signal});
+  first.abort();
+  assert_equals(shared.activeSubscribers, 0);
+  await collectAfterCurrentJob(t);
+  assert_true(weak[0].deref() instanceof Subscriber);
+  assert_true(weak[0].deref().active);
+  shared.subscribe();
+  assert_equals(shared.activeSubscribers, 1);
+  assert_equals(weak.length, 1, 'A reachable shared owner retains its kept-alive execution');
+}, 'A kept-alive SharedObservable retains its execution across GC with zero observers');
+
+promise_test(async t => {
+  const weak = [];
+  const shared = new SharedObservable(s => weak.push(new WeakRef(s)));
+  const first = new AbortController();
+  shared.subscribe({}, {signal: first.signal});
+  first.abort();
+  assert_false(weak[0].deref().active);
+  await collectAfterCurrentJob(t);
+  assert_equals(weak[0].deref(), undefined);
+  shared.subscribe();
+  assert_equals(weak.length, 2);
+  weak[1].deref().complete();
+}, 'Resetting a shared execution releases it and allows a new execution');
 </script>
-</body>

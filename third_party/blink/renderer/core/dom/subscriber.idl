@@ -18,5 +18,3 @@ interface Subscriber {
   readonly attribute boolean active;
   readonly attribute AbortSignal signal;
 };
-
-

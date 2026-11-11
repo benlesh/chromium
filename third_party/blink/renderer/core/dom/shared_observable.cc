@@ -6,6 +6,7 @@
 
 #include <cmath>
 
+#include "third_party/blink/renderer/bindings/core/v8/frozen_array.h"
 #include "third_party/blink/renderer/bindings/core/v8/native_value_traits_impl.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_share_config.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_shared_observable_config.h"
@@ -114,7 +115,7 @@ SharedObservable* SharedObservable::Create(
   auto* observable = MakeGarbageCollected<SharedObservable>(
       ExecutionContext::From(state), config->producer(), settings);
   if (config->sharedSources())
-    observable->SetSharedSources(*config->sharedSources());
+    observable->InitializeSharedSources(*config->sharedSources());
   return observable;
 }
 
@@ -156,7 +157,11 @@ uint64_t SharedObservable::activeSubscribers() const {
   return count;
 }
 
-HeapVector<ScriptValue> SharedObservable::replayValues() const {
+const FrozenArray<IDLAny>* SharedObservable::replayValues() const {
+  return MakeGarbageCollected<FrozenArray<IDLAny>>(ReplaySnapshot());
+}
+
+HeapVector<ScriptValue> SharedObservable::ReplaySnapshot() const {
   HeapVector<ScriptValue> snapshot;
   snapshot.ReserveInitialCapacity(replay_values_.size());
   for (wtf_size_t i = replay_start_; i < replay_values_.size(); ++i)
@@ -167,14 +172,14 @@ HeapVector<ScriptValue> SharedObservable::replayValues() const {
 }
 
 void SharedObservable::SubscribeShared(ScriptState* state,
-                                       ObservableInternalObserver* observer,
+                                       ObservableSubscriptionObserver* observer,
                                        SubscribeOptions* options) {
   AbortSignal* signal = options->hasSignal() ? options->signal() : nullptr;
   if (signal && signal->aborted())
     return;
 
   // Freeze the replay iteration before invoking any author code.
-  const HeapVector<ScriptValue> history = replayValues();
+  const HeapVector<ScriptValue> history = ReplaySnapshot();
   if (terminal_ != Terminal::kNone) {
     auto* replay = CreateSubscriber(state, observer, options);
     closed_replay_subscribers_.push_back(replay);

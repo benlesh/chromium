@@ -7,7 +7,8 @@
 // Note that in the spec, the named properties object is not implemented as
 // its own idl interface. This is an implementation convenience.
 [
-    LegacyNoInterfaceObject
+    LegacyNoInterfaceObject,
+    SkipInInterfaceObjectPrototypeChain
 ] interface WindowProperties : EventTarget {
     [NotEnumerable, CrossOrigin] getter object (DOMString name);
 };

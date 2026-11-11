@@ -1,31 +1,94 @@
+// https://github.com/WICG/observable/pull/222
+// Spec revision: fdd017d413c87888824e8de7e1b67d7fce150c85
+
+dictionary TerminationConfig {
+  boolean close = false;
+};
+
 [Exposed=*]
 interface Subscriber {
   undefined next(any value);
-  undefined error(any error);
-  undefined complete();
+  undefined error(any error, optional TerminationConfig config = {});
+  undefined complete(optional TerminationConfig config = {});
   undefined addTeardown(VoidFunction teardown);
   readonly attribute boolean active;
   readonly attribute AbortSignal signal;
 };
 
-
 callback SubscribeCallback = undefined (Subscriber subscriber);
-callback SubscriptionObserverCallback = undefined (any value);
-
+callback ObservableSubscriptionCallback = undefined (any value);
 dictionary SubscriptionObserver {
-  SubscriptionObserverCallback next;
-  SubscriptionObserverCallback error;
+  ObservableSubscriptionCallback next;
+  ObservableSubscriptionCallback error;
   VoidFunction complete;
 };
-
-typedef (SubscriptionObserverCallback or Observer) ObserverUnion;
-
+callback ObservableInspectorAbortHandler = undefined (any value);
+dictionary ObservableInspector {
+  ObservableSubscriptionCallback next;
+  ObservableSubscriptionCallback error;
+  VoidFunction complete;
+  VoidFunction subscribe;
+  ObservableInspectorAbortHandler abort;
+};
+typedef (ObservableSubscriptionCallback or SubscriptionObserver) ObserverUnion;
+typedef (ObservableSubscriptionCallback or ObservableInspector) ObservableInspectorUnion;
 dictionary SubscribeOptions {
   AbortSignal signal;
 };
+dictionary ObservableConfig {
+  required SubscribeCallback producer;
+  sequence<SharedObservable>? sharedSources = null;
+};
+dictionary ShareConfig {
+  any maxReplayValues;
+  boolean closeOnComplete;
+  boolean closeOnError;
+  boolean closeOnLastUnsubscribe;
+  boolean keepAliveOnLastUnsubscribe;
+};
+dictionary SharedObservableConfig : ObservableConfig {
+  any maxReplayValues;
+  boolean closeOnComplete;
+  boolean closeOnError;
+  boolean closeOnLastUnsubscribe;
+  boolean keepAliveOnLastUnsubscribe;
+};
+callback Predicate = boolean (any value, unsigned long long index);
+callback Mapper = any (any value, unsigned long long index);
+callback CatchCallback = any (any value);
 
 [Exposed=*]
 interface Observable {
-  constructor(SubscribeCallback callback);
+  constructor((SubscribeCallback or ObservableConfig) producer);
+  readonly attribute FrozenArray<SharedObservable>? sharedSources;
   undefined subscribe(optional ObserverUnion observer = {}, optional SubscribeOptions options = {});
+  static Observable from(any value);
+  SharedObservable share(optional ShareConfig config = {});
+  Observable takeUntil(any value);
+  Observable map(Mapper mapper);
+  Observable filter(Predicate predicate);
+  Observable take(unsigned long long amount);
+  Observable drop(unsigned long long amount);
+  Observable flatMap(Mapper mapper);
+  Observable switchMap(Mapper mapper);
+  Observable inspect(optional ObservableInspectorUnion inspectorUnion = {});
+  Observable catch(CatchCallback callback);
+  Observable finally(VoidFunction callback);
+};
+
+[Exposed=*]
+interface SharedObservable : Observable {
+  constructor((SubscribeCallback or SharedObservableConfig) producer);
+  readonly attribute unsigned long long activeSubscribers;
+  readonly attribute FrozenArray<any> replayValues;
+  readonly attribute unsigned long long maxReplayValues;
+};
+
+dictionary ObservableEventListenerOptions {
+  boolean capture = false;
+  boolean passive;
+};
+
+partial interface EventTarget {
+  Observable when(DOMString type, optional ObservableEventListenerOptions options = {});
 };

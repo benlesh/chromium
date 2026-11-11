@@ -5,8 +5,6 @@
 #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVABLE_H_
 #define THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVABLE_H_
 
-#include <optional>
-
 #include "base/types/pass_key.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
 #include "third_party/blink/renderer/core/core_export.h"
@@ -18,7 +16,10 @@ namespace blink {
 
 class ExecutionContext;
 class ExceptionState;
+template <typename IDLType>
+class FrozenArray;
 class ObservableInternalObserver;
+class ObservableSubscriptionObserver;
 class ScriptState;
 class Subscriber;
 class SharedObservable;
@@ -97,8 +98,8 @@ class CORE_EXPORT Observable : public ScriptWrappable,
   Observable* finally(ScriptState*, V8VoidFunction*);
 
   SharedObservable* share(ScriptState*, const ShareConfig*, ExceptionState&);
-  std::optional<HeapVector<Member<SharedObservable>>> sharedSources() const;
-  void SetSharedSources(const HeapVector<Member<SharedObservable>>&);
+  const FrozenArray<SharedObservable>* sharedSources() const;
+  void InitializeSharedSources(const HeapVector<Member<SharedObservable>>&);
   Observable* PropagateSharedSources(Observable* result,
                                      Observable* other = nullptr);
   virtual SharedObservable* AsSharedObservable() { return nullptr; }
@@ -117,7 +118,7 @@ class CORE_EXPORT Observable : public ScriptWrappable,
 
  protected:
   Subscriber* CreateSubscriber(ScriptState*,
-                               ObservableInternalObserver*,
+                               ObservableSubscriptionObserver*,
                                SubscribeOptions*,
                                SharedObservable* shared_owner = nullptr);
   void StartProducer(Subscriber*, ScriptState*);
@@ -142,10 +143,10 @@ class CORE_EXPORT Observable : public ScriptWrappable,
   const Member<V8SubscribeCallback> subscribe_callback_;
   const Member<SubscribeDelegate> subscribe_delegate_;
 
-  HeapVector<Member<SharedObservable>> shared_sources_;
+  // Initialized once by the construction/composition path, before exposure.
+  Member<FrozenArray<SharedObservable>> shared_sources_;
 };
 
 }  // namespace blink
 
 #endif  // THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVABLE_H_
-

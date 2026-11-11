@@ -13,7 +13,7 @@ dictionary SharedObservableConfig : ObservableConfig {
 
 [Exposed=(Window,Worker,ShadowRealm)]
 interface SharedObservable : Observable {
-  [CallWith=ScriptState, RaisesException] constructor((SubscribeCallback or SharedObservableConfig) producer);
+  [CallWith=ScriptState, RaisesException, MeasureAs=SharedObservableConstructor] constructor((SubscribeCallback or SharedObservableConfig) producer);
   readonly attribute unsigned long long activeSubscribers;
   readonly attribute FrozenArray<any> replayValues;
   readonly attribute unsigned long long maxReplayValues;

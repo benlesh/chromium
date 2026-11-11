@@ -5,6 +5,7 @@
 #include "third_party/blink/renderer/core/dom/observable.h"
 
 #include "base/types/pass_key.h"
+#include "third_party/blink/renderer/bindings/core/v8/frozen_array.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_function.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_catch_callback.h"
@@ -26,6 +27,7 @@
 #include "third_party/blink/renderer/core/dom/abort_signal.h"
 #include "third_party/blink/renderer/core/dom/document.h"
 #include "third_party/blink/renderer/core/dom/observable_internal_observer.h"
+#include "third_party/blink/renderer/core/dom/observable_subscription_observer.h"
 #include "third_party/blink/renderer/core/dom/shared_observable.h"
 #include "third_party/blink/renderer/core/dom/subscriber.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
@@ -81,37 +83,6 @@ class ScriptCallbackInternalObserver final : public ObservableInternalObserver {
   Member<V8ObserverCallback> next_callback_;
   Member<V8ObserverCallback> error_callback_;
   Member<V8ObserverCompleteCallback> complete_callback_;
-};
-
-// Each subscription has a distinct observer identity and cancellation guard.
-// Retain the consumer signal through terminal delivery, even after the producer
-// has detached its abort algorithms. An earlier terminal callback can cancel a
-// later observer in the captured recipient list.
-class SubscriptionObserver final : public ObservableInternalObserver {
- public:
-  SubscriptionObserver(ObservableInternalObserver* observer,
-                       AbortSignal* signal)
-      : observer_(observer), signal_(signal) {}
-  void Next(ScriptValue value) override {
-    if (!signal_ || !signal_->aborted())
-      observer_->Next(value);
-  }
-  void Error(ScriptState* state, ScriptValue value) override {
-    if (!signal_ || !signal_->aborted())
-      observer_->Error(state, value);
-  }
-  void Complete() override {
-    if (!signal_ || !signal_->aborted())
-      observer_->Complete();
-  }
-  void Trace(Visitor* visitor) const override {
-    visitor->Trace(observer_);
-    visitor->Trace(signal_);
-    ObservableInternalObserver::Trace(visitor);
-  }
- private:
-  Member<ObservableInternalObserver> observer_;
-  Member<AbortSignal> signal_;
 };
 
 class OperatorFromPromiseSubscribeDelegate final
@@ -230,6 +201,9 @@ class OperatorCatchSubscribeDelegate final
         outer_subscriber_->error(script_state_, mapped_value.error());
         return;
       }
+
+      if (!outer_subscriber_->active())
+        return;
 
       ScriptState::Scope scope(script_state_);
       v8::TryCatch try_catch(script_state_->GetIsolate());
@@ -655,7 +629,7 @@ class OperatorSwitchMapSubscribeDelegate final
       CHECK(mapper_);
     }
 
-    // https://wicg.github.io/observable/#switchmap-next-steps.
+    // https://wicg.github.io/observable/#dom-observable-switchmap
     void Next(ScriptValue value) override {
       if (!outer_subscriber_->active() || !script_state_->ContextIsValid())
         return;
@@ -675,7 +649,7 @@ class OperatorSwitchMapSubscribeDelegate final
     void Error(ScriptState*, ScriptValue error) override {
       outer_subscriber_->error(script_state_, error);
     }
-    // https://wicg.github.io/observable/#switchmap-complete-steps.
+    // https://wicg.github.io/observable/#dom-observable-switchmap
     void Complete() override {
       outer_subscription_has_completed_ = true;
 
@@ -693,7 +667,7 @@ class OperatorSwitchMapSubscribeDelegate final
       ObservableInternalObserver::Trace(visitor);
     }
 
-    // https://wicg.github.io/observable/#switchmap-process-next-value-steps.
+    // https://wicg.github.io/observable/#dom-observable-switchmap
     void SwitchMapProcessNextValueSteps(ScriptValue value,
                                         AbortController* replacement) {
       // `ScriptState::Scope` can only be created in a valid context, so
@@ -2037,7 +2011,7 @@ Observable* Observable::Create(
   auto* observable = MakeGarbageCollected<Observable>(
       ExecutionContext::From(script_state), config->producer());
   if (config->sharedSources()) {
-    observable->SetSharedSources(*config->sharedSources());
+    observable->InitializeSharedSources(*config->sharedSources());
   }
   return observable;
 }
@@ -2137,20 +2111,22 @@ void Observable::SubscribeInternal(
   if (options->hasSignal() && options->signal()->aborted()) {
     return;
   }
-  observer = MakeGarbageCollected<SubscriptionObserver>(
-      observer, options->hasSignal() ? options->signal() : nullptr);
+  auto* delivery_observer =
+      MakeGarbageCollected<ObservableSubscriptionObserver>(
+          observer, options->hasSignal() ? options->signal() : nullptr);
   if (auto* shared = AsSharedObservable()) {
-    shared->SubscribeShared(script_state, observer, options);
+    shared->SubscribeShared(script_state, delivery_observer, options);
     return;
   }
-  auto* subscriber = CreateSubscriber(script_state, observer, options);
+  auto* subscriber = CreateSubscriber(script_state, delivery_observer, options);
   StartProducer(subscriber, script_state);
 }
 
-Subscriber* Observable::CreateSubscriber(ScriptState* state,
-                                         ObservableInternalObserver* observer,
-                                         SubscribeOptions* options,
-                                         SharedObservable* shared_owner) {
+Subscriber* Observable::CreateSubscriber(
+    ScriptState* state,
+    ObservableSubscriptionObserver* observer,
+    SubscribeOptions* options,
+    SharedObservable* shared_owner) {
   return MakeGarbageCollected<Subscriber>(PassKey(), state, observer, options,
                                           shared_owner);
 }
@@ -2176,22 +2152,40 @@ bool Observable::IsContextRunnable(ExecutionContext* context) {
   if (!context || context->IsContextDestroyed())
     return false;
   auto* window = DynamicTo<LocalDOMWindow>(context);
-  return !window || window->document()->IsActive();
+  if (!window)
+    return true;
+  // Document::IsActive() only checks its lifecycle state. A Document must also
+  // be displayed in its frame, outside BFCache, with active ancestors. Remote
+  // ancestor navigation detaches the local subtree; BFCache state propagates
+  // to each local execution context, including cross-process descendants.
+  if (!window->document())
+    return false;
+  for (Document* document = window->document(); document;
+       document = document->ParentDocument()) {
+    auto* owner = document->domWindow();
+    if (!document->IsActive() || !owner ||
+        !owner->IsCurrentlyDisplayedInFrame() ||
+        owner->is_in_back_forward_cache())
+      return false;
+  }
+  return true;
 }
 
-std::optional<HeapVector<Member<SharedObservable>>> Observable::sharedSources()
-    const {
-  if (shared_sources_.empty())
-    return std::nullopt;
-  return shared_sources_;
+const FrozenArray<SharedObservable>* Observable::sharedSources() const {
+  return shared_sources_.Get();
 }
 
-void Observable::SetSharedSources(
+void Observable::InitializeSharedSources(
     const HeapVector<Member<SharedObservable>>& sources) {
-  shared_sources_.clear();
+  DCHECK(!shared_sources_);
+  HeapVector<Member<SharedObservable>> unique_sources;
   for (auto& source : sources) {
-    if (source.Get() != this && !shared_sources_.Contains(source))
-      shared_sources_.push_back(source);
+    if (source.Get() != this && !unique_sources.Contains(source))
+      unique_sources.push_back(source);
+  }
+  if (!unique_sources.empty()) {
+    shared_sources_ = MakeGarbageCollected<FrozenArray<SharedObservable>>(
+        std::move(unique_sources));
   }
 }
 
@@ -2201,14 +2195,14 @@ Observable* Observable::PropagateSharedSources(Observable* result,
   auto append = [&](Observable* input) {
     if (auto* shared = input->AsSharedObservable()) {
       sources.push_back(shared);
-    } else {
-      sources.AppendVector(input->shared_sources_);
+    } else if (input->shared_sources_) {
+      sources.AppendVector(input->shared_sources_->AsVector());
     }
   };
   append(this);
   if (other)
     append(other);
-  result->SetSharedSources(sources);
+  result->InitializeSharedSources(sources);
   return result;
 }
 
@@ -2461,7 +2455,6 @@ Observable* Observable::finally(ScriptState*, V8VoidFunction* callback) {
   return PropagateSharedSources(return_observable);
 }
 
-
 void Observable::Trace(Visitor* visitor) const {
   visitor->Trace(subscribe_callback_);
   visitor->Trace(subscribe_delegate_);
@@ -2472,4 +2465,3 @@ void Observable::Trace(Visitor* visitor) const {
 }
 
 }  // namespace blink
-

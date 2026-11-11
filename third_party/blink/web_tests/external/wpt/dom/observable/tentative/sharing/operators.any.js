@@ -60,12 +60,15 @@ test(() => {
   assert_array_equals(b, [2, 3, "complete"]);
 }, "Sharing after take() deliberately shares its allowance");
 
-for (const method of ["map", "filter"]) {
+for (const method of ["map", "filter", "flatMap", "switchMap"]) {
   test(() => {
     let sink;
     const source = new SharedObservable(s => { sink = s; });
     const seen = [];
-    const result = source[method]((value, index) => { seen.push(value, index); return true; });
+    const result = source[method]((value, index) => {
+      seen.push(value, index);
+      return [value];
+    });
     result.subscribe();
     sink.next("first");
     result.subscribe();

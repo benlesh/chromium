@@ -18,7 +18,7 @@
 #include "third_party/blink/renderer/core/dom/abort_controller.h"
 #include "third_party/blink/renderer/core/dom/abort_signal.h"
 #include "third_party/blink/renderer/core/dom/observable.h"
-#include "third_party/blink/renderer/core/dom/observable_internal_observer.h"
+#include "third_party/blink/renderer/core/dom/observable_subscription_observer.h"
 #include "third_party/blink/renderer/core/dom/shared_observable.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
 #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
@@ -32,7 +32,7 @@ class Subscriber::ConsumerAbortSubscriptionAlgorithm final
  public:
   explicit ConsumerAbortSubscriptionAlgorithm(
       Subscriber& subscriber,
-      ObservableInternalObserver& associated_observer,
+      ObservableSubscriptionObserver& associated_observer,
       AbortSignal& signal,
       ScriptState& script_state)
       : subscriber_(subscriber),
@@ -63,14 +63,14 @@ class Subscriber::ConsumerAbortSubscriptionAlgorithm final
   // aborted (i.e., `Run()` is called above) we can alert `subscriber_` as to
   // which observer needs to be unregistered so that it doesn't receive values
   // from the producer.
-  Member<ObservableInternalObserver> associated_observer_;
+  Member<ObservableSubscriptionObserver> associated_observer_;
   Member<AbortSignal> signal_;
   Member<ScriptState> script_state_;
 };
 
 Subscriber::Subscriber(base::PassKey<Observable>,
                        ScriptState* script_state,
-                       ObservableInternalObserver* internal_observer,
+                       ObservableSubscriptionObserver* internal_observer,
                        SubscribeOptions* options,
                        SharedObservable* shared_owner)
     : ExecutionContextClient(ExecutionContext::From(script_state)),
@@ -86,6 +86,7 @@ Subscriber::Subscriber(base::PassKey<Observable>,
     AbortSignal* downstream_signal = options->signal();
 
     if (downstream_signal->aborted()) {
+      internal_observer->Detach();
       internal_observers_.pop_back();
       CloseSubscription(
           script_state,
@@ -117,13 +118,12 @@ void Subscriber::next(ScriptValue value) {
   // `internal_observers_`. That means `internal_observers_` can be mutated
   // throughout this process, and we cannot iterate over it while it is
   // mutating.
-  HeapVector<Member<ObservableInternalObserver>> internal_observers =
+  HeapVector<Member<ObservableSubscriptionObserver>> internal_observers =
       internal_observers_;
   for (auto& observer : internal_observers) {
     if (!active_)
       break;
-    if (internal_observers_.Contains(observer))
-      observer->Next(value);
+    observer->Next(value);
   }
 }
 
@@ -186,8 +186,9 @@ AbortSignal* Subscriber::signal() const {
 
 void Subscriber::ConsumerUnsubscribe(
     ScriptState* script_state,
-    ObservableInternalObserver* associated_observer,
+    ObservableSubscriptionObserver* associated_observer,
     std::optional<ScriptValue> abort_reason) {
+  associated_observer->Detach();
   // If the producer closes the subscription before any consumer abort signal
   // algorithms attempt, the consumer abort signal algorithms can still fire,
   // attempting to close the subscription. Do nothing if it's already closed.
@@ -271,7 +272,7 @@ void Subscriber::CloseSubscription(ScriptState* script_state,
 }
 
 void Subscriber::RegisterNewObserver(ScriptState* script_state,
-                                     ObservableInternalObserver* observer,
+                                     ObservableSubscriptionObserver* observer,
                                      SubscribeOptions* options) {
   // A kept-alive execution can have zero observers when another one joins.
   CHECK(active_);
@@ -281,6 +282,7 @@ void Subscriber::RegisterNewObserver(ScriptState* script_state,
     AbortSignal* downstream_signal = options->signal();
 
     if (downstream_signal->aborted()) {
+      observer->Detach();
       internal_observers_.pop_back();
       return;
     }
@@ -294,10 +296,10 @@ void Subscriber::RegisterNewObserver(ScriptState* script_state,
   }
 }
 
-void Subscriber::ReplayTo(ObservableInternalObserver* observer,
+void Subscriber::ReplayTo(ObservableSubscriptionObserver* observer,
                           const HeapVector<ScriptValue>& history) {
   for (const auto& value : history) {
-    if (!active_ || !internal_observers_.Contains(observer) ||
+    if (!active_ || observer->IsCanceled() ||
         !Observable::IsContextRunnable(GetExecutionContext()))
       break;
     observer->Next(value);
@@ -316,4 +318,3 @@ void Subscriber::Trace(Visitor* visitor) const {
 }
 
 }  // namespace blink
-
