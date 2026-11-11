@@ -8211,7 +8211,9 @@ const WrapperTypeInfo ${class_name}::wrapper_type_info_{{
     else:
         assert False
     is_skipped_in_interface_object_prototype_chain = (
-        "true" if class_like.identifier == "WindowProperties" else "false"
+        "true"
+        if "SkipInInterfaceObjectPrototypeChain" in class_like.extended_attributes
+        else "false"
     )
     wrapper_type_info_def.append(
         F(

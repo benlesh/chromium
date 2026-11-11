@@ -17,13 +17,9 @@ namespace blink {
 // for holding onto the concrete "next", "error", and "complete" algorithms that
 // `Subscriber::{next(), error(), complete()} ultimately invoke.
 //
-// Most of the time these algorithms are whatever JavaScript passes in as
-// callbacks in the Web IDL `Observer` dictionary. But for the various
-// Promise-returning operators on the Observable interface [1], it is C++ that
-// subscribes to an Observable, passing in its own native "next", "error", and
-// "complete" algorithms in the `ObservableInternalObserver`.
-//
-// [1]: https://wicg.github.io/observable/#promise-returning-operators)
+// JavaScript callbacks and native Observable operator delegates both use this
+// interface. ObservableSubscriptionObserver wraps each consumer registration
+// with its own identity and cancellation state.
 class CORE_EXPORT ObservableInternalObserver
     : public GarbageCollected<ObservableInternalObserver> {
  public:

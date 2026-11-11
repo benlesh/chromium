@@ -5,36 +5,40 @@
 #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVABLE_H_
 #define THIRD_PARTY_BLINK_RENDERER_CORE_DOM_OBSERVABLE_H_
 
-#include <optional>
-
 #include "base/types/pass_key.h"
-#include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
+#include "third_party/blink/renderer/bindings/core/v8/script_value.h"
 #include "third_party/blink/renderer/core/core_export.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_observer.h"
 #include "third_party/blink/renderer/platform/bindings/script_wrappable.h"
+#include "third_party/blink/renderer/platform/heap/collection_support/heap_vector.h"
 
 namespace blink {
 
 class ExecutionContext;
+class ExceptionState;
+template <typename IDLType>
+class FrozenArray;
 class ObservableInternalObserver;
+class ObservableSubscriptionObserver;
 class ScriptState;
 class Subscriber;
+class SharedObservable;
+class ShareConfig;
+class V8UnionObservableConfigOrSubscribeCallback;
 class SubscribeOptions;
 class V8CatchCallback;
 class V8Mapper;
 class V8Predicate;
-class V8Reducer;
 class V8SubscribeCallback;
 class V8UnionObservableInspectorOrObserverCallback;
 class V8UnionObserverOrObserverCallback;
-class V8Visitor;
 class V8VoidFunction;
 
 // Implementation of the DOM `Observable` API. See
 // https://github.com/WICG/observable and
 // https://docs.google.com/document/d/1NEobxgiQO-fTSocxJBqcOOOVZRmXcTFg9Iqrhebb7bg/edit.
-class CORE_EXPORT Observable final : public ScriptWrappable,
-                                     public ExecutionContextClient {
+class CORE_EXPORT Observable : public ScriptWrappable,
+                               public ExecutionContextClient {
   DEFINE_WRAPPERTYPEINFO();
 
  public:
@@ -51,7 +55,8 @@ class CORE_EXPORT Observable final : public ScriptWrappable,
   };
 
   // Called by v8 bindings.
-  static Observable* Create(ScriptState*, V8SubscribeCallback*);
+  static Observable* Create(ScriptState*,
+                            const V8UnionObservableConfigOrSubscribeCallback*);
 
   Observable(ExecutionContext*, V8SubscribeCallback*);
   Observable(ExecutionContext*, SubscribeDelegate*);
@@ -67,7 +72,7 @@ class CORE_EXPORT Observable final : public ScriptWrappable,
 
   // Observable-returning operators. See
   // https://wicg.github.io/observable/#observable-returning-operators.
-  Observable* takeUntil(ScriptState*, Observable*);
+  Observable* takeUntil(ScriptState*, ScriptValue, ExceptionState&);
   Observable* map(ScriptState*, V8Mapper*);
   Observable* filter(ScriptState*, V8Predicate*);
   Observable* take(ScriptState*, uint64_t);
@@ -92,24 +97,13 @@ class CORE_EXPORT Observable final : public ScriptWrappable,
   Observable* catchImpl(ScriptState*, V8CatchCallback*, ExceptionState&);
   Observable* finally(ScriptState*, V8VoidFunction*);
 
-  // Promise-returning operators. See
-  // https://wicg.github.io/observable/#promise-returning-operators.
-  ScriptPromise<IDLSequence<IDLAny>> toArray(ScriptState*, SubscribeOptions*);
-  ScriptPromise<IDLUndefined> forEach(ScriptState*,
-                                      V8Visitor*,
-                                      SubscribeOptions*);
-  ScriptPromise<IDLAny> first(ScriptState*, SubscribeOptions*);
-  ScriptPromise<IDLAny> last(ScriptState*, SubscribeOptions*);
-  ScriptPromise<IDLBoolean> some(ScriptState*, V8Predicate*, SubscribeOptions*);
-  ScriptPromise<IDLBoolean> every(ScriptState*,
-                                  V8Predicate*,
-                                  SubscribeOptions*);
-  ScriptPromise<IDLAny> find(ScriptState*, V8Predicate*, SubscribeOptions*);
-  ScriptPromise<IDLAny> reduce(ScriptState*, V8Reducer*);
-  ScriptPromise<IDLAny> reduce(ScriptState*,
-                               V8Reducer*,
-                               v8::Local<v8::Value>,
-                               SubscribeOptions*);
+  SharedObservable* share(ScriptState*, const ShareConfig*, ExceptionState&);
+  const FrozenArray<SharedObservable>* sharedSources() const;
+  void InitializeSharedSources(const HeapVector<Member<SharedObservable>>&);
+  Observable* PropagateSharedSources(Observable* result,
+                                     Observable* other = nullptr);
+  virtual SharedObservable* AsSharedObservable() { return nullptr; }
+  static bool IsContextRunnable(ExecutionContext*);
 
   void Trace(Visitor*) const override;
 
@@ -122,13 +116,14 @@ class CORE_EXPORT Observable final : public ScriptWrappable,
                                    ObservableInternalObserver*,
                                    SubscribeOptions*);
 
- private:
-  // Used by both overloads of `reduce()`.
-  ScriptPromise<IDLAny> ReduceInternal(ScriptState*,
-                                       V8Reducer*,
-                                       std::optional<ScriptValue>,
-                                       SubscribeOptions*);
+ protected:
+  Subscriber* CreateSubscriber(ScriptState*,
+                               ObservableSubscriptionObserver*,
+                               SubscribeOptions*,
+                               SharedObservable* shared_owner = nullptr);
+  void StartProducer(Subscriber*, ScriptState*);
 
+ private:
   // The `ScriptState` argument does not need to be associated with a valid
   // context (this method early-returns in that case).
   void SubscribeInternal(ScriptState*,
@@ -148,12 +143,8 @@ class CORE_EXPORT Observable final : public ScriptWrappable,
   const Member<V8SubscribeCallback> subscribe_callback_;
   const Member<SubscribeDelegate> subscribe_delegate_;
 
-  // The most recent `Subscriber` associated with `this`. It is set in
-  // `SubscribeInternal`, and used to register all subsequent subscriptions
-  // until it becomes inactive or garbage collected. Once inactive or garbage
-  // collected, `this` no longer has an "active" subscription, and this member
-  // will be set anew in subsequent invocations of `SubscribeInternal()`.
-  WeakMember<Subscriber> weak_subscriber_;
+  // Initialized once by the construction/composition path, before exposure.
+  Member<FrozenArray<SharedObservable>> shared_sources_;
 };
 
 }  // namespace blink

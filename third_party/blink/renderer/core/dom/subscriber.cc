@@ -13,11 +13,13 @@
 #include "third_party/blink/renderer/bindings/core/v8/v8_observer_complete_callback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_script_runner.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_subscribe_options.h"
+#include "third_party/blink/renderer/bindings/core/v8/v8_termination_config.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_void_function.h"
 #include "third_party/blink/renderer/core/dom/abort_controller.h"
 #include "third_party/blink/renderer/core/dom/abort_signal.h"
 #include "third_party/blink/renderer/core/dom/observable.h"
-#include "third_party/blink/renderer/core/dom/observable_internal_observer.h"
+#include "third_party/blink/renderer/core/dom/observable_subscription_observer.h"
+#include "third_party/blink/renderer/core/dom/shared_observable.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
 #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
 
@@ -30,7 +32,7 @@ class Subscriber::ConsumerAbortSubscriptionAlgorithm final
  public:
   explicit ConsumerAbortSubscriptionAlgorithm(
       Subscriber& subscriber,
-      ObservableInternalObserver& associated_observer,
+      ObservableSubscriptionObserver& associated_observer,
       AbortSignal& signal,
       ScriptState& script_state)
       : subscriber_(subscriber),
@@ -61,16 +63,18 @@ class Subscriber::ConsumerAbortSubscriptionAlgorithm final
   // aborted (i.e., `Run()` is called above) we can alert `subscriber_` as to
   // which observer needs to be unregistered so that it doesn't receive values
   // from the producer.
-  Member<ObservableInternalObserver> associated_observer_;
+  Member<ObservableSubscriptionObserver> associated_observer_;
   Member<AbortSignal> signal_;
   Member<ScriptState> script_state_;
 };
 
 Subscriber::Subscriber(base::PassKey<Observable>,
                        ScriptState* script_state,
-                       ObservableInternalObserver* internal_observer,
-                       SubscribeOptions* options)
+                       ObservableSubscriptionObserver* internal_observer,
+                       SubscribeOptions* options,
+                       SharedObservable* shared_owner)
     : ExecutionContextClient(ExecutionContext::From(script_state)),
+      shared_owner_(shared_owner),
       subscription_controller_(AbortController::Create(script_state)) {
   internal_observers_.push_back(internal_observer);
 
@@ -82,6 +86,7 @@ Subscriber::Subscriber(base::PassKey<Observable>,
     AbortSignal* downstream_signal = options->signal();
 
     if (downstream_signal->aborted()) {
+      internal_observer->Detach();
       internal_observers_.pop_back();
       CloseSubscription(
           script_state,
@@ -100,9 +105,12 @@ Subscriber::Subscriber(base::PassKey<Observable>,
 }
 
 void Subscriber::next(ScriptValue value) {
-  if (!active_) {
+  if (!active_ || !Observable::IsContextRunnable(GetExecutionContext())) {
     return;
   }
+
+  if (shared_owner_)
+    shared_owner_->RecordNext(this, value);
 
   // Call `Next()` on all observers. Do this by iterating over a *copy* of the
   // list of observers, because `Next()` can actually complete one of the
@@ -110,32 +118,29 @@ void Subscriber::next(ScriptValue value) {
   // `internal_observers_`. That means `internal_observers_` can be mutated
   // throughout this process, and we cannot iterate over it while it is
   // mutating.
-  HeapVector<Member<ObservableInternalObserver>> internal_observers =
+  HeapVector<Member<ObservableSubscriptionObserver>> internal_observers =
       internal_observers_;
   for (auto& observer : internal_observers) {
+    if (!active_)
+      break;
     observer->Next(value);
   }
 }
 
-void Subscriber::complete(ScriptState* script_state) {
-  if (!active_) {
+void Subscriber::complete(ScriptState* script_state,
+                          const TerminationConfig* config) {
+  if (!active_ || !Observable::IsContextRunnable(GetExecutionContext()))
     return;
-  }
-
-  // `CloseSubscription()` makes it impossible to invoke user-provided callbacks
-  // via `internal_observers_` anymore/re-entrantly, which is why we pull the
-  // `internal_observer` out before calling this.
-  CloseSubscription(script_state, /*abort_reason=*/std::nullopt);
-
-  // See the documentation in `Subscriber::next()`.
-  HeapVector<Member<ObservableInternalObserver>> internal_observers =
-      internal_observers_;
-  for (auto& observer : internal_observers) {
+  auto observers = std::move(internal_observers_);
+  CloseSubscription(script_state, std::nullopt, true, false,
+                    config && config->close());
+  for (auto& observer : observers)
     observer->Complete();
-  }
 }
 
-void Subscriber::error(ScriptState* script_state, ScriptValue error_value) {
+void Subscriber::error(ScriptState* script_state,
+                       ScriptValue error_value,
+                       const TerminationConfig* config) {
   if (!active_) {
     // If `active_` is false, the subscription has already been closed by
     // `CloseSubscription()`. In this case, if the observable is still producing
@@ -154,20 +159,18 @@ void Subscriber::error(ScriptState* script_state, ScriptValue error_value) {
     return;
   }
 
-  // `CloseSubscription()` makes it impossible to invoke user-provided callbacks
-  // via `internal_observers_` anymore/re-entrantly, which is why we pull the
-  // `internal_observer` out before calling this.
-  CloseSubscription(script_state, error_value);
-
-  // See the documentation in `Subscriber::next()`.
-  HeapVector<Member<ObservableInternalObserver>> internal_observers =
-      internal_observers_;
-  for (auto& observer : internal_observers) {
+  if (!Observable::IsContextRunnable(GetExecutionContext()))
+    return;
+  auto observers = std::move(internal_observers_);
+  CloseSubscription(script_state, error_value, true, true,
+                    config && config->close());
+  for (auto& observer : observers)
     observer->Error(script_state, error_value);
-  }
 }
 
 void Subscriber::addTeardown(V8VoidFunction* teardown) {
+  if (!Observable::IsContextRunnable(GetExecutionContext()))
+    return;
   if (active_) {
     teardown_callbacks_.push_back(teardown);
   } else {
@@ -183,8 +186,9 @@ AbortSignal* Subscriber::signal() const {
 
 void Subscriber::ConsumerUnsubscribe(
     ScriptState* script_state,
-    ObservableInternalObserver* associated_observer,
+    ObservableSubscriptionObserver* associated_observer,
     std::optional<ScriptValue> abort_reason) {
+  associated_observer->Detach();
   // If the producer closes the subscription before any consumer abort signal
   // algorithms attempt, the consumer abort signal algorithms can still fire,
   // attempting to close the subscription. Do nothing if it's already closed.
@@ -204,13 +208,17 @@ void Subscriber::ConsumerUnsubscribe(
   internal_observers_.erase(
       std::ranges::find(internal_observers_, associated_observer));
 
-  if (internal_observers_.empty()) {
+  if (internal_observers_.empty() &&
+      (!shared_owner_ || !shared_owner_->KeepAlive())) {
     CloseSubscription(script_state, abort_reason);
   }
 }
 
 void Subscriber::CloseSubscription(ScriptState* script_state,
-                                   std::optional<ScriptValue> abort_reason) {
+                                   std::optional<ScriptValue> abort_reason,
+                                   bool terminal,
+                                   bool is_error,
+                                   bool close) {
   // Guard against re-entrant invocation, which can happen during
   // producer-initiated unsubscription. For example: `complete()` ->
   // `CloseSubscription()` -> Run script (either by aborting an `AbortSignal` or
@@ -232,6 +240,10 @@ void Subscriber::CloseSubscription(ScriptState* script_state,
   //     `Subscriber#active` false, and makes it impossible for `this` to emit
   //     any more values to downstream `Observer`-provided callbacks.
   active_ = false;
+  auto teardowns = std::move(teardown_callbacks_);
+  if (shared_owner_) {
+    shared_owner_->EndExecution(this, terminal, is_error, close, abort_reason);
+  }
 
   // 2. Abort `subscription_controller_`. This actually does two things:
   //    (a) Immediately aborts any "upstream" subscriptions, i.e., any
@@ -252,25 +264,25 @@ void Subscriber::CloseSubscription(ScriptState* script_state,
   // cannot be modified anymore. If any of these callbacks below invoke
   // `addTeardown()` with a *new* callback, it will be invoked synchronously
   // instead of added to this vector.
-  for (Member<V8VoidFunction>& teardown :
-       std::views::reverse(teardown_callbacks_)) {
+  for (Member<V8VoidFunction>& teardown : std::views::reverse(teardowns)) {
+    if (!Observable::IsContextRunnable(GetExecutionContext()))
+      break;
     teardown->InvokeAndReportException(nullptr);
   }
-  teardown_callbacks_.clear();
 }
 
 void Subscriber::RegisterNewObserver(ScriptState* script_state,
-                                     ObservableInternalObserver* observer,
+                                     ObservableSubscriptionObserver* observer,
                                      SubscribeOptions* options) {
-  // We can only hit this path if there is already at least one subscriber that
-  // forced the creation of `this` and subscribed via `this`'s constructor.
-  CHECK_GE(internal_observers_.size(), 1u);
+  // A kept-alive execution can have zero observers when another one joins.
+  CHECK(active_);
   internal_observers_.push_back(observer);
 
   if (options->hasSignal()) {
     AbortSignal* downstream_signal = options->signal();
 
     if (downstream_signal->aborted()) {
+      observer->Detach();
       internal_observers_.pop_back();
       return;
     }
@@ -284,7 +296,18 @@ void Subscriber::RegisterNewObserver(ScriptState* script_state,
   }
 }
 
+void Subscriber::ReplayTo(ObservableSubscriptionObserver* observer,
+                          const HeapVector<ScriptValue>& history) {
+  for (const auto& value : history) {
+    if (!active_ || observer->IsCanceled() ||
+        !Observable::IsContextRunnable(GetExecutionContext()))
+      break;
+    observer->Next(value);
+  }
+}
+
 void Subscriber::Trace(Visitor* visitor) const {
+  visitor->Trace(shared_owner_);
   visitor->Trace(subscription_controller_);
   visitor->Trace(consumer_abort_algorithms_);
   visitor->Trace(teardown_callbacks_);

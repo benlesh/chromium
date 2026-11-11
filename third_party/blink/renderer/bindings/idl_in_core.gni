@@ -205,6 +205,7 @@ static_idl_files_in_core = [
   "//third_party/blink/renderer/core/dom/range.idl",
   "//third_party/blink/renderer/core/dom/shadow_root.idl",
   "//third_party/blink/renderer/core/dom/shadow_root_init.idl",
+  "//third_party/blink/renderer/core/dom/shared_observable.idl",
   "//third_party/blink/renderer/core/dom/static_range.idl",
   "//third_party/blink/renderer/core/dom/static_range_init.idl",
   "//third_party/blink/renderer/core/dom/subscriber.idl",

@@ -124,30 +124,15 @@ v8::Local<v8::Function> V8PerContextData::ConstructorForTypeSlowCase(
 
   v8::Local<v8::Function> parent_interface_object;
   if (auto* parent = type->parent_class) {
-    if (parent->is_skipped_in_interface_object_prototype_chain) [[unlikely]] {
-      // This is a special case for WindowProperties.
-      // We need to set up the inheritance of Window as the following:
-      //   Window.__proto__ === EventTarget
-      // although the prototype chain is the following:
-      //   Window.prototype.__proto__           === the named properties object
-      //   Window.prototype.__proto__.__proto__ === EventTarget.prototype
-      // where the named properties object is WindowProperties.prototype in
-      // our implementation (although WindowProperties is not JS observable).
-      // Let WindowProperties be skipped and make
-      // Window.__proto__ == EventTarget.
-      DCHECK(parent->parent_class);
-      DCHECK(!parent->parent_class
-                  ->is_skipped_in_interface_object_prototype_chain);
-
-      // We still need to initialize the interface object for the parent being
-      // skipped to ensure that the object is initialized properly. It will
-      // also populate the cache with the parent interface object, making the
-      // next call a cache hit.
+    while (parent && parent->is_skipped_in_interface_object_prototype_chain) {
+      // Initialize the skipped interface's instance prototype, but do not
+      // inherit its constructor. This covers WindowProperties and Observable.
+      // Skipping a root leaves the constructor on Function.prototype.
       std::ignore = ConstructorForType(parent);
-
       parent = parent->parent_class;
     }
-    parent_interface_object = ConstructorForType(parent);
+    if (parent)
+      parent_interface_object = ConstructorForType(parent);
   }
 
   const DOMWrapperWorld& world = DOMWrapperWorld::World(isolate_, context);

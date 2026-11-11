@@ -82,8 +82,13 @@ v8::Local<v8::Function> V8ObjectConstructor::CreateInterfaceObject(
   v8::Local<v8::Function> interface_object =
       interface_template->GetFunction(context).ToLocalChecked();
 
-  if (type->parent_class) {
-    DCHECK(!parent_interface.IsEmpty());
+  const WrapperTypeInfo* expected_parent = type->parent_class;
+  while (expected_parent &&
+         expected_parent->is_skipped_in_interface_object_prototype_chain) {
+    expected_parent = expected_parent->parent_class;
+  }
+  DCHECK_EQ(expected_parent != nullptr, !parent_interface.IsEmpty());
+  if (!parent_interface.IsEmpty()) {
     interface_object->SetPrototype(context, parent_interface).Check();
   }
 

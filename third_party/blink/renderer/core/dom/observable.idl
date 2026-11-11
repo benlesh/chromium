@@ -8,12 +8,8 @@ callback SubscribeCallback = void (Subscriber subscriber);
 callback ObserverCallback = void (any value);
 callback ObserverCompleteCallback = void ();
 
-callback Reducer = any (any accumulator, any currentValue, unsigned long long index);
 callback Mapper = any (any element, unsigned long long index);
 
-// Differs from Mapper only in return type, since this callback is exclusively
-// used to visit each element in a sequence, not transform it.
-callback Visitor = undefined (any element, unsigned long long index);
 // This matches the predicate in the ECMAScript Iterator helpers proposal, i.e.,
 // including the `index` parameter.
 callback Predicate = boolean (any value, unsigned long long index);
@@ -42,12 +38,28 @@ dictionary SubscribeOptions {
   AbortSignal signal;
 };
 
+dictionary ObservableConfig {
+  required SubscribeCallback producer;
+  sequence<SharedObservable>? sharedSources = null;
+};
+
+dictionary ShareConfig {
+  any maxReplayValues;
+  boolean closeOnComplete;
+  boolean closeOnError;
+  boolean closeOnLastUnsubscribe;
+  boolean keepAliveOnLastUnsubscribe;
+};
+
 typedef (ObserverCallback or Observer) ObserverUnion;
 typedef (ObserverCallback or ObservableInspector) ObservableInspectorUnion;
 
-[Exposed=(Window,Worker,ShadowRealm)] // TODO(crbug.com/40282760): This should be Exposed=*
+[Exposed=(Window,Worker,ShadowRealm), SkipInInterfaceObjectPrototypeChain] // TODO(crbug.com/40282760): This should be Exposed=*
 interface Observable {
-  [CallWith=ScriptState, MeasureAs=ObservableConstructor] constructor(SubscribeCallback callback);
+  [CallWith=ScriptState, MeasureAs=ObservableConstructor] constructor((SubscribeCallback or ObservableConfig) callback);
+  readonly attribute FrozenArray<SharedObservable>? sharedSources;
+  [CallWith=ScriptState, RaisesException, MeasureAs=ObservableShare] SharedObservable share(optional ShareConfig config = {});
+
   [CallWith=ScriptState] void subscribe(optional ObserverUnion observer = {}, optional SubscribeOptions options = {});
 
   [CallWith=ScriptState, RaisesException] static Observable from(any value);
@@ -55,10 +67,7 @@ interface Observable {
   // Observable-returning operators.
   // See https://wicg.github.io/observable/#observable-returning-operators.
   //
-  // TODO(crbug.com/1485981): The `Observable` argument type below should be
-  // `any`, and the conversion semantics (that have not yet been implemented)
-  // should convert that `any` into an `Observable`.
-  [CallWith=ScriptState] Observable takeUntil(Observable notifier);
+  [CallWith=ScriptState, RaisesException] Observable takeUntil(any notifier);
   [CallWith=ScriptState] Observable map(Mapper mapper);
   [CallWith=ScriptState] Observable filter(Predicate predicate);
   [CallWith=ScriptState] Observable take(unsigned long long number_to_take);
@@ -69,15 +78,4 @@ interface Observable {
   [CallWith=ScriptState, RaisesException, ImplementedAs=catchImpl] Observable catch(CatchCallback callback);
   [CallWith=ScriptState] Observable finally(VoidFunction callback);
 
-  // Promise-returning operators.
-  // See https://wicg.github.io/observable/#promise-returning-operators.
-  [CallWith=ScriptState] Promise<sequence<any>> toArray(optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<undefined> forEach(Visitor callback, optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<any> first(optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<any> last(optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<boolean> some(Predicate predicate, optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<boolean> every(Predicate predicate, optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<any> find(Predicate predicate, optional SubscribeOptions options = {});
-  [CallWith=ScriptState] Promise<any> reduce(Reducer reducer, optional any initialValue, optional SubscribeOptions options = {});
 };
-

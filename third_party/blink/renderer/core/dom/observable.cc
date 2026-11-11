@@ -5,29 +5,33 @@
 #include "third_party/blink/renderer/core/dom/observable.h"
 
 #include "base/types/pass_key.h"
+#include "third_party/blink/renderer/bindings/core/v8/frozen_array.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_function.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_promise.h"
-#include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_catch_callback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_mapper.h"
+#include "third_party/blink/renderer/bindings/core/v8/v8_observable_config.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_observable_inspector.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_observable_inspector_abort_handler.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_observer.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_observer_callback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_observer_complete_callback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_predicate.h"
-#include "third_party/blink/renderer/bindings/core/v8/v8_reducer.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_subscribe_callback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_subscribe_options.h"
+#include "third_party/blink/renderer/bindings/core/v8/v8_union_observableconfig_subscribecallback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_union_observableinspector_observercallback.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_union_observer_observercallback.h"
-#include "third_party/blink/renderer/bindings/core/v8/v8_visitor.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_void_function.h"
 #include "third_party/blink/renderer/core/dom/abort_controller.h"
-#include "third_party/blink/renderer/core/dom/dom_exception.h"
+#include "third_party/blink/renderer/core/dom/abort_signal.h"
+#include "third_party/blink/renderer/core/dom/document.h"
 #include "third_party/blink/renderer/core/dom/observable_internal_observer.h"
+#include "third_party/blink/renderer/core/dom/observable_subscription_observer.h"
+#include "third_party/blink/renderer/core/dom/shared_observable.h"
 #include "third_party/blink/renderer/core/dom/subscriber.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+#include "third_party/blink/renderer/core/frame/local_dom_window.h"
 #include "third_party/blink/renderer/platform/bindings/exception_state.h"
 #include "third_party/blink/renderer/platform/bindings/script_state.h"
 #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
@@ -35,46 +39,6 @@
 namespace blink {
 
 namespace {
-
-// A helper wrapper since we cannot hold `Member<ScriptValue>` directly.
-class ScriptValueHolder final : public GarbageCollected<ScriptValueHolder> {
- public:
-  explicit ScriptValueHolder(ScriptValue value) : value_(value) {}
-  const ScriptValue& Value() const { return value_; }
-  void Trace(Visitor* visitor) const { visitor->Trace(value_); }
-
- private:
-  ScriptValue value_;
-};
-
-class RejectPromiseAbortAlgorithm final : public AbortSignal::Algorithm {
- public:
-  RejectPromiseAbortAlgorithm(ScriptPromiseResolverBase* resolver,
-                              AbortSignal* signal)
-      : resolver_(resolver), signal_(signal) {
-    CHECK(resolver);
-    CHECK(signal);
-  }
-
-  void Run() override {
-    resolver_->Reject(signal_->reason(resolver_->GetScriptState()));
-  }
-
-  void Trace(Visitor* visitor) const override {
-    visitor->Trace(resolver_);
-    visitor->Trace(signal_);
-
-    Algorithm::Trace(visitor);
-  }
-
- private:
-  // The `ScriptPromiseResolverBase` that `this` must reject when `signal_` is
-  // aborted (as notified by `Run()` above).
-  Member<ScriptPromiseResolverBase> resolver_;
-  // Never null. We have to store the `signal_` that `this` is associated with
-  // in order to get the abort reason.
-  Member<AbortSignal> signal_;
-};
 
 class ScriptCallbackInternalObserver final : public ObservableInternalObserver {
  public:
@@ -121,522 +85,6 @@ class ScriptCallbackInternalObserver final : public ObservableInternalObserver {
   Member<V8ObserverCompleteCallback> complete_callback_;
 };
 
-class ToArrayInternalObserver final : public ObservableInternalObserver {
- public:
-  ToArrayInternalObserver(ScriptPromiseResolver<IDLSequence<IDLAny>>* resolver,
-                          AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver), abort_algorithm_handle_(handle) {}
-
-  void Next(ScriptValue value) override {
-    // "Append the passed in value to values."
-    values_.push_back(value);
-  }
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "Resolve p with values."
-    resolver_->Resolve(values_);
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(values_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  Member<ScriptPromiseResolver<IDLSequence<IDLAny>>> resolver_;
-  HeapVector<ScriptValue> values_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-// This is the internal observer associated with the `reduce()` operator. See
-// https://wicg.github.io/observable/#dom-observable-reduce for its definition
-// and spec prose.
-class OperatorReduceInternalObserver final : public ObservableInternalObserver {
- public:
-  OperatorReduceInternalObserver(ScriptPromiseResolver<IDLAny>* resolver,
-                                 AbortController* controller,
-                                 V8Reducer* reducer,
-                                 std::optional<ScriptValue> initial_value,
-                                 AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver),
-        controller_(controller),
-        reducer_(reducer),
-        abort_algorithm_handle_(handle) {
-    CHECK(resolver_);
-    CHECK(controller_);
-    CHECK(reducer_);
-    CHECK(abort_algorithm_handle_);
-    if (initial_value) {
-      accumulator_ = MakeGarbageCollected<ScriptValueHolder>(*initial_value);
-    }
-  }
-
-  void Next(ScriptValue value) override {
-    if (!accumulator_) [[unlikely]] {
-      // For all subsequent values, we will take the path where `accumulator_`
-      // is *not* null, and we invoke `reducer_` with it.
-      accumulator_ = MakeGarbageCollected<ScriptValueHolder>(value);
-      // Adjust the index, so that when we first call `reducer_` on the *second*
-      // value, the index is adjusted accordingly.
-      idx_++;
-      return;
-    }
-
-    // `ScriptState::Scope` can only be created in a valid context, so
-    // early-return if we're in a detached one.
-    ScriptState* script_state = resolver_->GetScriptState();
-    if (!script_state->ContextIsValid()) {
-      return;
-    }
-
-    auto result = reducer_->InvokeAndCatch(
-        /*thisArg=*/nullptr, /*accumulator=*/accumulator_->Value(),
-        /*currentValue=*/value, /*index=*/idx_++);
-    if (!result.has_value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Reject(result.error());
-      controller_->abort(script_state, result.error());
-      return;
-    }
-
-    // Since we handled the exception case above, `result` must not be
-    // `v8::Nothing`.
-    accumulator_ = MakeGarbageCollected<ScriptValueHolder>(result.value());
-  }
-
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    if (accumulator_) {
-      resolver_->Resolve(accumulator_->Value());
-    } else {
-      v8::Isolate* isolate = resolver_->GetScriptState()->GetIsolate();
-      resolver_->Reject(V8ThrowException::CreateTypeError(
-          isolate, "Reduce of empty array with no initial value"));
-    }
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(controller_);
-    visitor->Trace(reducer_);
-    visitor->Trace(accumulator_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  uint64_t idx_ = 0;
-  Member<ScriptPromiseResolver<IDLAny>> resolver_;
-  Member<AbortController> controller_;
-  Member<V8Reducer> reducer_;
-  // `accumulator_` is initually null unless `initialValue` is passed into the
-  // constructor of `this`. When `accumulator_` is initially null, we eventually
-  // set it to the first value that `this` encounters in `Next()`. Then, for all
-  // subsequent values, we use `accumulator_` as the "accumulator" argument for
-  // `reducer_` callback above.
-  Member<ScriptValueHolder> accumulator_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-// This is the internal observer associated with the `find()` operator. See
-// https://wicg.github.io/observable/#dom-observable-find for its definition
-// and spec prose quoted below.
-class OperatorFindInternalObserver final : public ObservableInternalObserver {
- public:
-  OperatorFindInternalObserver(ScriptPromiseResolver<IDLAny>* resolver,
-                               AbortController* controller,
-                               V8Predicate* predicate,
-                               AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver),
-        controller_(controller),
-        predicate_(predicate),
-        abort_algorithm_handle_(handle) {
-    CHECK(resolver_);
-    CHECK(controller_);
-    CHECK(predicate_);
-    CHECK(abort_algorithm_handle_);
-  }
-
-  void Next(ScriptValue value) override {
-    // `ScriptState::Scope` can only be created in a valid context, so
-    // early-return if we're in a detached one.
-    ScriptState* script_state = resolver_->GetScriptState();
-    if (!script_state->ContextIsValid()) {
-      return;
-    }
-
-    const auto matches = predicate_->InvokeAndCatch(nullptr, value, idx_++);
-    if (!matches.has_value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Reject(matches.error());
-      controller_->abort(script_state, matches.error());
-      return;
-    }
-
-    if (matches.value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Resolve(value);
-      controller_->abort(resolver_->GetScriptState());
-    }
-  }
-
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "Resolve p with undefined."
-    resolver_->Resolve(
-        v8::Undefined(resolver_->GetScriptState()->GetIsolate()));
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(controller_);
-    visitor->Trace(predicate_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  uint64_t idx_ = 0;
-  Member<ScriptPromiseResolver<IDLAny>> resolver_;
-  Member<AbortController> controller_;
-  Member<V8Predicate> predicate_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-// This is the internal observer associated with the `every()` operator. See
-// https://wicg.github.io/observable/#dom-observable-every for its definition
-// and spec prose quoted below.
-class OperatorEveryInternalObserver final : public ObservableInternalObserver {
- public:
-  OperatorEveryInternalObserver(ScriptPromiseResolver<IDLBoolean>* resolver,
-                                AbortController* controller,
-                                V8Predicate* predicate,
-                                AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver),
-        controller_(controller),
-        predicate_(predicate),
-        abort_algorithm_handle_(handle) {
-    CHECK(resolver_);
-    CHECK(controller_);
-    CHECK(predicate_);
-    CHECK(abort_algorithm_handle_);
-  }
-
-  void Next(ScriptValue value) override {
-    // `ScriptState::Scope` can only be created in a valid context, so
-    // early-return if we're in a detached one.
-    ScriptState* script_state = resolver_->GetScriptState();
-    if (!script_state->ContextIsValid()) {
-      return;
-    }
-
-    const auto matches = predicate_->InvokeAndCatch(nullptr, value, idx_++);
-    if (!matches.has_value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Reject(matches.error());
-      controller_->abort(script_state, matches.error());
-      return;
-    }
-
-    if (!matches.value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Resolve(false);
-      controller_->abort(resolver_->GetScriptState());
-    }
-  }
-
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "Resolve p with true."
-    resolver_->Resolve(true);
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(controller_);
-    visitor->Trace(predicate_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  uint64_t idx_ = 0;
-  Member<ScriptPromiseResolver<IDLBoolean>> resolver_;
-  Member<AbortController> controller_;
-  Member<V8Predicate> predicate_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-// This is the internal observer associated with the `some()` operator. See
-// https://wicg.github.io/observable/#dom-observable-some for its definition
-// and spec prose quoted below.
-class OperatorSomeInternalObserver final : public ObservableInternalObserver {
- public:
-  OperatorSomeInternalObserver(ScriptPromiseResolver<IDLBoolean>* resolver,
-                               AbortController* controller,
-                               V8Predicate* predicate,
-                               AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver),
-        controller_(controller),
-        predicate_(predicate),
-        abort_algorithm_handle_(handle) {
-    CHECK(resolver_);
-    CHECK(controller_);
-    CHECK(predicate_);
-    CHECK(abort_algorithm_handle_);
-  }
-
-  void Next(ScriptValue value) override {
-    // `ScriptState::Scope` can only be created in a valid context, so
-    // early-return if we're in a detached one.
-    ScriptState* script_state = resolver_->GetScriptState();
-    if (!script_state->ContextIsValid()) {
-      return;
-    }
-
-    auto matches = predicate_->InvokeAndCatch(nullptr, value, idx_++);
-    if (!matches.has_value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Reject(matches.error());
-      controller_->abort(script_state, matches.error());
-      return;
-    }
-
-    if (matches.value()) {
-      abort_algorithm_handle_.Clear();
-      resolver_->Resolve(true);
-      controller_->abort(resolver_->GetScriptState());
-    }
-  }
-
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "Resolve p with false".
-    resolver_->Resolve(false);
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(controller_);
-    visitor->Trace(predicate_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  uint64_t idx_ = 0;
-  Member<ScriptPromiseResolver<IDLBoolean>> resolver_;
-  Member<AbortController> controller_;
-  Member<V8Predicate> predicate_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-// This is the internal observer associated with the `last()` operator. See
-// https://wicg.github.io/observable/#dom-observable-last for its definition
-// and spec prose quoted below.
-class OperatorLastInternalObserver final : public ObservableInternalObserver {
- public:
-  OperatorLastInternalObserver(ScriptPromiseResolver<IDLAny>* resolver,
-                               AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver), abort_algorithm_handle_(handle) {}
-
-  void Next(ScriptValue value) override {
-    last_value_ = MakeGarbageCollected<ScriptValueHolder>(value);
-  }
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "If lastValue is not null, resolve p with lastValue."
-    if (last_value_) {
-      resolver_->Resolve(last_value_->Value());
-      return;
-    }
-
-    // "Otherwise, reject p with a new RangeError."
-    v8::Isolate* isolate = resolver_->GetScriptState()->GetIsolate();
-    resolver_->Reject(
-        ScriptValue(isolate, V8ThrowException::CreateRangeError(
-                                 isolate, "No values in Observable")));
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(abort_algorithm_handle_);
-    visitor->Trace(last_value_);
-  }
-
- private:
-  Member<ScriptPromiseResolver<IDLAny>> resolver_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-  Member<ScriptValueHolder> last_value_;
-};
-
-// This is the internal observer associated with the `first()` operator. See
-// https://wicg.github.io/observable/#dom-observable-first for its definition
-// and spec prose quoted below.
-class OperatorFirstInternalObserver final : public ObservableInternalObserver {
- public:
-  OperatorFirstInternalObserver(ScriptPromiseResolver<IDLAny>* resolver,
-                                AbortController* controller,
-                                AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver),
-        controller_(controller),
-        abort_algorithm_handle_(handle) {}
-
-  void Next(ScriptValue value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Resolve p with the passed in value."
-    resolver_->Resolve(value);
-    // "Signal abort controller".
-    controller_->abort(resolver_->GetScriptState());
-  }
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with a new RangeError."
-    v8::Isolate* isolate = resolver_->GetScriptState()->GetIsolate();
-    resolver_->Reject(
-        ScriptValue(isolate, V8ThrowException::CreateRangeError(
-                                 isolate, "No values in Observable")));
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(controller_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  Member<ScriptPromiseResolver<IDLAny>> resolver_;
-  Member<AbortController> controller_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-class OperatorForEachInternalObserver final
-    : public ObservableInternalObserver {
- public:
-  OperatorForEachInternalObserver(ScriptPromiseResolver<IDLUndefined>* resolver,
-                                  AbortController* controller,
-                                  V8Visitor* callback,
-                                  AbortSignal::AlgorithmHandle* handle)
-      : resolver_(resolver),
-        controller_(controller),
-        callback_(callback),
-        abort_algorithm_handle_(handle) {}
-
-  void Next(ScriptValue value) override {
-    // Invoke callback with the passed in value.
-    //
-    // If an exception |E| was thrown, then reject |p| with |E| and signal
-    // abort |visitor callback controller| with |E|.
-
-    // `ScriptState::Scope` can only be created in a valid context, so
-    // early-return if we're in a detached one.
-    ScriptState* script_state = resolver_->GetScriptState();
-    if (!script_state->ContextIsValid()) {
-      return;
-    }
-
-    // Invoking `callback_` can detach the context, but that's OK, nothing below
-    // this invocation relies on an attached/valid context.
-    auto result = callback_->InvokeAndCatch(nullptr, value, idx_++);
-    if (!result.has_value()) {
-      resolver_->Reject(result.error());
-      controller_->abort(script_state, result.error());
-    }
-  }
-  void Error(ScriptState* script_state, ScriptValue error_value) override {
-    abort_algorithm_handle_.Clear();
-
-    // "Reject p with the passed in error."
-    resolver_->Reject(error_value);
-  }
-  void Complete() override {
-    abort_algorithm_handle_.Clear();
-
-    // "Resolve p with undefined."
-    resolver_->Resolve();
-  }
-
-  void Trace(Visitor* visitor) const override {
-    ObservableInternalObserver::Trace(visitor);
-
-    visitor->Trace(resolver_);
-    visitor->Trace(controller_);
-    visitor->Trace(callback_);
-    visitor->Trace(abort_algorithm_handle_);
-  }
-
- private:
-  uint64_t idx_ = 0;
-  Member<ScriptPromiseResolver<IDLUndefined>> resolver_;
-  Member<AbortController> controller_;
-  Member<V8Visitor> callback_;
-  Member<AbortSignal::AlgorithmHandle> abort_algorithm_handle_;
-};
-
-// This delegate is used by the `Observer#from()` operator, in the case where
-// the given `any` value is a `Promise`. It simply utilizes the promise's
-// then/catch handlers to pipe the corresponding fulfilled/rejection value to
-// the Observable in a one-shot manner.
 class OperatorFromPromiseSubscribeDelegate final
     : public Observable::SubscribeDelegate {
  public:
@@ -753,6 +201,9 @@ class OperatorCatchSubscribeDelegate final
         outer_subscriber_->error(script_state_, mapped_value.error());
         return;
       }
+
+      if (!outer_subscriber_->active())
+        return;
 
       ScriptState::Scope scope(script_state_);
       v8::TryCatch try_catch(script_state_->GetIsolate());
@@ -1178,20 +629,27 @@ class OperatorSwitchMapSubscribeDelegate final
       CHECK(mapper_);
     }
 
-    // https://wicg.github.io/observable/#switchmap-next-steps.
+    // https://wicg.github.io/observable/#dom-observable-switchmap
     void Next(ScriptValue value) override {
-      if (active_inner_abort_controller_) {
-        active_inner_abort_controller_->abort(script_state_);
-      }
-
-      active_inner_abort_controller_ = AbortController::Create(script_state_);
-
-      SwitchMapProcessNextValueSteps(value);
+      if (!outer_subscriber_->active() || !script_state_->ContextIsValid())
+        return;
+      auto* previous = active_inner_abort_controller_.Get();
+      auto* replacement = AbortController::Create(script_state_);
+      active_inner_abort_controller_ = replacement;
+      if (previous)
+        previous->abort(script_state_);
+      if (!IsCurrent(replacement))
+        return;
+      SwitchMapProcessNextValueSteps(value, replacement);
+    }
+    bool IsCurrent(AbortController* controller) const {
+      return outer_subscriber_->active() &&
+             active_inner_abort_controller_ == controller;
     }
     void Error(ScriptState*, ScriptValue error) override {
       outer_subscriber_->error(script_state_, error);
     }
-    // https://wicg.github.io/observable/#switchmap-complete-steps.
+    // https://wicg.github.io/observable/#dom-observable-switchmap
     void Complete() override {
       outer_subscription_has_completed_ = true;
 
@@ -1209,19 +667,23 @@ class OperatorSwitchMapSubscribeDelegate final
       ObservableInternalObserver::Trace(visitor);
     }
 
-    // https://wicg.github.io/observable/#switchmap-process-next-value-steps.
-    void SwitchMapProcessNextValueSteps(ScriptValue value) {
+    // https://wicg.github.io/observable/#dom-observable-switchmap
+    void SwitchMapProcessNextValueSteps(ScriptValue value,
+                                        AbortController* replacement) {
       // `ScriptState::Scope` can only be created in a valid context, so
       // early-return if we're in a detached one.
       if (!script_state_->ContextIsValid()) {
         return;
       }
 
-      auto result = mapper_->InvokeAndCatch(nullptr, value, ++idx_);
+      auto result = mapper_->InvokeAndCatch(nullptr, value, idx_++);
       if (!result.has_value()) {
         outer_subscriber_->error(script_state_, result.error());
         return;
       }
+
+      if (!IsCurrent(replacement))
+        return;
 
       // Since we handled the exception case above, `mapped_value` must not be
       // `v8::Nothing`.
@@ -1241,6 +703,9 @@ class OperatorSwitchMapSubscribeDelegate final
         return;
       }
 
+      if (!IsCurrent(replacement))
+        return;
+
       // The `AbortSignal` with which we subscribe to the "inner" Observable is
       // dependent on two signals:
       //   1. The outer subscriber's signal; this one is no surprise, so that we
@@ -1253,7 +718,7 @@ class OperatorSwitchMapSubscribeDelegate final
       //      abort the inner Observable when the outer source Observable emits
       //      new values.
       DCHECK(active_inner_abort_controller_);
-      signals.push_back(active_inner_abort_controller_->signal());
+      signals.push_back(replacement->signal());
 
       SubscribeOptions* options = MakeGarbageCollected<SubscribeOptions>();
       options->setSignal(
@@ -1261,17 +726,18 @@ class OperatorSwitchMapSubscribeDelegate final
 
       inner_observable->SubscribeWithNativeObserver(
           script_state_,
-          MakeGarbageCollected<InnerSwitchMapObserver>(outer_subscriber_, this),
+          MakeGarbageCollected<InnerSwitchMapObserver>(outer_subscriber_, this,
+                                                       replacement),
           options);
     }
 
-    void InnerObservableCompleted() {
-      if (outer_subscription_has_completed_) {
-        outer_subscriber_->complete(script_state_);
+    void InnerObservableCompleted(AbortController* controller) {
+      if (!IsCurrent(controller))
         return;
-      }
-
       active_inner_abort_controller_ = nullptr;
+      controller->abort(script_state_);
+      if (outer_subscription_has_completed_ && !active_inner_abort_controller_)
+        outer_subscriber_->complete(script_state_);
     }
 
    private:
@@ -1294,17 +760,26 @@ class OperatorSwitchMapSubscribeDelegate final
     class InnerSwitchMapObserver final : public ObservableInternalObserver {
      public:
       InnerSwitchMapObserver(Subscriber* outer_subscriber,
-                             SourceInternalObserver* source_observer)
+                             SourceInternalObserver* source_observer,
+                             AbortController* controller)
           : outer_subscriber_(outer_subscriber),
-            source_observer_(source_observer) {}
+            source_observer_(source_observer),
+            controller_(controller) {}
 
-      void Next(ScriptValue value) override { outer_subscriber_->next(value); }
-      void Error(ScriptState* script_state, ScriptValue value) override {
-        outer_subscriber_->error(script_state, value);
+      void Next(ScriptValue value) override {
+        if (source_observer_->IsCurrent(controller_))
+          outer_subscriber_->next(value);
       }
-      void Complete() override { source_observer_->InnerObservableCompleted(); }
+      void Error(ScriptState* script_state, ScriptValue value) override {
+        if (source_observer_->IsCurrent(controller_))
+          outer_subscriber_->error(script_state, value);
+      }
+      void Complete() override {
+        source_observer_->InnerObservableCompleted(controller_);
+      }
 
       void Trace(Visitor* visitor) const override {
+        visitor->Trace(controller_);
         visitor->Trace(source_observer_);
         visitor->Trace(outer_subscriber_);
 
@@ -1314,6 +789,7 @@ class OperatorSwitchMapSubscribeDelegate final
      private:
       Member<Subscriber> outer_subscriber_;
       Member<SourceInternalObserver> source_observer_;
+      Member<AbortController> controller_;
     };
 
     uint64_t idx_ = 0;
@@ -1443,16 +919,18 @@ class OperatorFlatMapSubscribeDelegate final
     void FlatMapProcessNextValueSteps(ScriptValue value) {
       // `ScriptState::Scope` can only be created in a valid context, so
       // early-return if we're in a detached one.
-      if (!script_state_->ContextIsValid()) {
+      if (!outer_subscriber_->active() || !script_state_->ContextIsValid()) {
         return;
       }
 
-      auto mapped_value = mapper_->InvokeAndCatch(nullptr, value, ++idx_);
+      auto mapped_value = mapper_->InvokeAndCatch(nullptr, value, idx_++);
       if (!mapped_value.has_value()) {
         outer_subscriber_->error(script_state_, mapped_value.error());
         return;
       }
 
+      if (!outer_subscriber_->active())
+        return;
       v8::TryCatch try_catch(script_state_->GetIsolate());
       Observable* inner_observable =
           Observable::from(script_state_, mapped_value.value(),
@@ -1481,6 +959,8 @@ class OperatorFlatMapSubscribeDelegate final
     // This method can be called re-entrantly. See the documentation above
     // `FlatMapProcessNextValueSteps()`.
     void InnerObservableCompleted() {
+      if (!outer_subscriber_->active())
+        return;
       if (!queue_.empty()) {
         ScriptValue value = queue_.front();
         // This is inefficient! See the documentation above `queue_` for more.
@@ -2166,13 +1646,18 @@ class OperatorTakeSubscribeDelegate final
       return;
     }
 
+    auto* upstream = AbortController::Create(script_state);
+    HeapVector<Member<AbortSignal>> signals;
+    signals.push_back(subscriber->signal());
+    signals.push_back(upstream->signal());
     SubscribeOptions* options = MakeGarbageCollected<SubscribeOptions>();
-    options->setSignal(subscriber->signal());
+    options->setSignal(
+        MakeGarbageCollected<AbortSignal>(script_state, signals));
 
     source_observable_->SubscribeWithNativeObserver(
         script_state,
         MakeGarbageCollected<SourceInternalObserver>(subscriber, script_state,
-                                                     number_to_take_),
+                                                     number_to_take_, upstream),
         options);
   }
 
@@ -2187,33 +1672,37 @@ class OperatorTakeSubscribeDelegate final
    public:
     SourceInternalObserver(Subscriber* subscriber,
                            ScriptState* script_state,
-                           uint64_t number_to_take)
+                           uint64_t number_to_take,
+                           AbortController* upstream)
         : subscriber_(subscriber),
           script_state_(script_state),
-          number_to_take_(number_to_take) {
+          number_to_take_(number_to_take),
+          upstream_(upstream) {
       CHECK(subscriber_);
       CHECK(script_state_);
       CHECK_GT(number_to_take_, 0ull);
     }
 
     void Next(ScriptValue value) override {
-      CHECK_GT(number_to_take_, 0ull);
-      // This can run script, which may detach the context, but that's OK
-      // because nothing below this invocation relies on an attached/valid
-      // context.
+      if (!subscriber_->active() || !number_to_take_)
+        return;
+      const bool last = --number_to_take_ == 0;
+      // Detach just this observation and run registered upstream cleanup before
+      // the final value reaches downstream. Cleanup is allowed to reenter.
+      if (last)
+        upstream_->abort(script_state_);
       subscriber_->next(value);
-      --number_to_take_;
-
-      if (!number_to_take_) {
+      if (last)
         subscriber_->complete(script_state_);
-      }
     }
+
     void Error(ScriptState*, ScriptValue error) override {
       subscriber_->error(script_state_, error);
     }
     void Complete() override { subscriber_->complete(script_state_); }
 
     void Trace(Visitor* visitor) const override {
+      visitor->Trace(upstream_);
       visitor->Trace(subscriber_);
       visitor->Trace(script_state_);
 
@@ -2224,6 +1713,7 @@ class OperatorTakeSubscribeDelegate final
     Member<Subscriber> subscriber_;
     Member<ScriptState> script_state_;
     uint64_t number_to_take_;
+    Member<AbortController> upstream_;
   };
   // The `Observable` which `this` will mirror, when `this` is subscribed to.
   Member<Observable> source_observable_;
@@ -2510,10 +2000,20 @@ class OperatorTakeUntilSubscribeDelegate final
 using PassKey = base::PassKey<Observable>;
 
 // static
-Observable* Observable::Create(ScriptState* script_state,
-                               V8SubscribeCallback* subscribe_callback) {
-  return MakeGarbageCollected<Observable>(ExecutionContext::From(script_state),
-                                          subscribe_callback);
+Observable* Observable::Create(
+    ScriptState* script_state,
+    const V8UnionObservableConfigOrSubscribeCallback* input) {
+  if (input->IsSubscribeCallback()) {
+    return MakeGarbageCollected<Observable>(
+        ExecutionContext::From(script_state), input->GetAsSubscribeCallback());
+  }
+  auto* config = input->GetAsObservableConfig();
+  auto* observable = MakeGarbageCollected<Observable>(
+      ExecutionContext::From(script_state), config->producer());
+  if (config->sharedSources()) {
+    observable->InitializeSharedSources(*config->sharedSources());
+  }
+  return observable;
 }
 
 Observable::Observable(ExecutionContext* execution_context,
@@ -2555,7 +2055,8 @@ void Observable::SubscribeInternal(
   // Cannot subscribe to an Observable that was constructed in a detached
   // context, because this might involve reporting an exception with the global,
   // which relies on a valid `ScriptState`.
-  if (!script_state->ContextIsValid()) {
+  if (!script_state->ContextIsValid() ||
+      !IsContextRunnable(GetExecutionContext())) {
     // Note that in this path, we used to have the following CHECK:
     //
     // CHECK(!GetExecutionContext());
@@ -2607,65 +2108,108 @@ void Observable::SubscribeInternal(
   }
 
   CHECK(observer);
-  if (weak_subscriber_ && weak_subscriber_->active()) {
-    weak_subscriber_->RegisterNewObserver(script_state, observer, options);
+  if (options->hasSignal() && options->signal()->aborted()) {
     return;
   }
+  auto* delivery_observer =
+      MakeGarbageCollected<ObservableSubscriptionObserver>(
+          observer, options->hasSignal() ? options->signal() : nullptr);
+  if (auto* shared = AsSharedObservable()) {
+    shared->SubscribeShared(script_state, delivery_observer, options);
+    return;
+  }
+  auto* subscriber = CreateSubscriber(script_state, delivery_observer, options);
+  StartProducer(subscriber, script_state);
+}
 
-  // Construct `weak_subscriber_` for the first subscription. This will take
-  // care of registering `observer` as the first observer.
-  weak_subscriber_ = MakeGarbageCollected<Subscriber>(PassKey(), script_state,
-                                                      observer, options);
+Subscriber* Observable::CreateSubscriber(
+    ScriptState* state,
+    ObservableSubscriptionObserver* observer,
+    SubscribeOptions* options,
+    SharedObservable* shared_owner) {
+  return MakeGarbageCollected<Subscriber>(PassKey(), state, observer, options,
+                                          shared_owner);
+}
 
-  // Exactly one of `subscribe_callback_` or `subscribe_delegate_` is non-null.
-  // Use whichever is provided.
-  CHECK_NE(!!subscribe_delegate_, !!subscribe_callback_)
-      << "Exactly one of subscribe_callback_ or subscribe_delegate_ should be "
-         "non-null";
+void Observable::StartProducer(Subscriber* subscriber,
+                               ScriptState* script_state) {
+  if (!subscriber->active() || !script_state->ContextIsValid() ||
+      !IsContextRunnable(GetExecutionContext()))
+    return;
+  CHECK_NE(!!subscribe_delegate_, !!subscribe_callback_);
   if (subscribe_delegate_) {
-    subscribe_delegate_->OnSubscribe(weak_subscriber_, script_state);
+    subscribe_delegate_->OnSubscribe(subscriber, script_state);
     return;
   }
+  // Keep the execution that was invoked: a callback can reset the shared owner
+  // and start another execution before returning or throwing.
+  auto result = subscribe_callback_->InvokeAndCatch(nullptr, subscriber);
+  if (!result.has_value())
+    subscriber->error(script_state, result.error());
+}
 
-  // Ordinarily we'd just invoke `subscribe_callback_` with
-  // `InvokeAndReportException()`, so that any exceptions get reported to the
-  // global. However, Observables have special semantics with the error handler
-  // passed in via `observer`. Specifically, if the subscribe callback throws an
-  // exception (that doesn't go through the manual `Subscriber::error()`
-  // pathway), we still give that method a first crack at handling the
-  // exception. This does one of two things:
-  //   1. Lets the provided `Observer#error()` handler run with the thrown
-  //      exception, if such handler was provided
-  //   2. Reports the exception to the global if no such handler was provided.
-  // See `Subscriber::error()` for more details.
-  //
-  // In either case, no exception in this path interrupts the ordinary flow of
-  // control. Therefore, `subscribe()` will never synchronously throw an
-  // exception.
-
-  auto result = subscribe_callback_->InvokeAndCatch(nullptr, weak_subscriber_);
-  if (!result.has_value()) {
-    // There are two cases where we might have a JS exception on the stack here:
-    //   1. The `subscribe_callback_` immediately started pushing values to the
-    //      observer, and somewhere along the way an exception was thrown. In
-    //      this case, `weak_subscriber_` is non-null, and still active. Report
-    //      the exception to it.
-    if (weak_subscriber_->active()) {
-      weak_subscriber_->error(script_state, result.error());
-    } else {
-      // 2. The `subscriber_callback_` immediately closed the subscription, and
-      //    during this, an error was thrown (an exception-throwing `complete()`
-      //    handler for example). In that case, `weak_subscriber_` is non-null
-      //    but inactive. Report the exception to the global instead of the
-      //    subscriber.
-      if (!script_state->ContextIsValid()) {
-        return;
-      }
-      ScriptState::Scope scope(script_state);
-      V8ScriptRunner::ReportException(script_state->GetIsolate(),
-                                      result.error().V8Value());
-    }
+bool Observable::IsContextRunnable(ExecutionContext* context) {
+  if (!context || context->IsContextDestroyed())
+    return false;
+  auto* window = DynamicTo<LocalDOMWindow>(context);
+  if (!window)
+    return true;
+  // Document::IsActive() only checks its lifecycle state. A Document must also
+  // be displayed in its frame, outside BFCache, with active ancestors. Remote
+  // ancestor navigation detaches the local subtree; BFCache state propagates
+  // to each local execution context, including cross-process descendants.
+  if (!window->document())
+    return false;
+  for (Document* document = window->document(); document;
+       document = document->ParentDocument()) {
+    auto* owner = document->domWindow();
+    if (!document->IsActive() || !owner ||
+        !owner->IsCurrentlyDisplayedInFrame() ||
+        owner->is_in_back_forward_cache())
+      return false;
   }
+  return true;
+}
+
+const FrozenArray<SharedObservable>* Observable::sharedSources() const {
+  return shared_sources_.Get();
+}
+
+void Observable::InitializeSharedSources(
+    const HeapVector<Member<SharedObservable>>& sources) {
+  DCHECK(!shared_sources_);
+  HeapVector<Member<SharedObservable>> unique_sources;
+  for (auto& source : sources) {
+    if (source.Get() != this && !unique_sources.Contains(source))
+      unique_sources.push_back(source);
+  }
+  if (!unique_sources.empty()) {
+    shared_sources_ = MakeGarbageCollected<FrozenArray<SharedObservable>>(
+        std::move(unique_sources));
+  }
+}
+
+Observable* Observable::PropagateSharedSources(Observable* result,
+                                               Observable* other) {
+  HeapVector<Member<SharedObservable>> sources;
+  auto append = [&](Observable* input) {
+    if (auto* shared = input->AsSharedObservable()) {
+      sources.push_back(shared);
+    } else if (input->shared_sources_) {
+      sources.AppendVector(input->shared_sources_->AsVector());
+    }
+  };
+  append(this);
+  if (other)
+    append(other);
+  result->InitializeSharedSources(sources);
+  return result;
+}
+
+SharedObservable* Observable::share(ScriptState* state,
+                                    const ShareConfig* config,
+                                    ExceptionState& exception_state) {
+  return SharedObservable::Share(state, this, config, exception_state);
 }
 
 // static
@@ -2784,7 +2328,12 @@ Observable* Observable::from(ScriptState* script_state,
   return nullptr;
 }
 
-Observable* Observable::takeUntil(ScriptState*, Observable* notifier) {
+Observable* Observable::takeUntil(ScriptState* state,
+                                  ScriptValue input,
+                                  ExceptionState& exception_state) {
+  Observable* notifier = from(state, input, exception_state);
+  if (exception_state.HadException())
+    return nullptr;
   // This method is just a loose wrapper that returns another `Observable`,
   // whose logic is defined by `OperatorTakeUntilSubscribeDelegate`. When
   // subscribed to, `return_observable` will simply mirror `this` until
@@ -2792,21 +2341,21 @@ Observable* Observable::takeUntil(ScriptState*, Observable* notifier) {
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorTakeUntilSubscribeDelegate>(this, notifier));
-  return return_observable;
+  return PropagateSharedSources(return_observable, notifier);
 }
 
 Observable* Observable::map(ScriptState*, V8Mapper* mapper) {
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorMapSubscribeDelegate>(this, mapper));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::filter(ScriptState*, V8Predicate* predicate) {
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorFilterSubscribeDelegate>(this, predicate));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::take(ScriptState*, uint64_t number_to_take) {
@@ -2814,7 +2363,7 @@ Observable* Observable::take(ScriptState*, uint64_t number_to_take) {
       GetExecutionContext(),
       MakeGarbageCollected<OperatorTakeSubscribeDelegate>(this,
                                                           number_to_take));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::drop(ScriptState*, uint64_t number_to_drop) {
@@ -2822,7 +2371,7 @@ Observable* Observable::drop(ScriptState*, uint64_t number_to_drop) {
       GetExecutionContext(),
       MakeGarbageCollected<OperatorDropSubscribeDelegate>(this,
                                                           number_to_drop));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::flatMap(ScriptState*,
@@ -2831,7 +2380,7 @@ Observable* Observable::flatMap(ScriptState*,
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorFlatMapSubscribeDelegate>(this, mapper));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::switchMap(ScriptState*,
@@ -2840,7 +2389,7 @@ Observable* Observable::switchMap(ScriptState*,
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorSwitchMapSubscribeDelegate>(this, mapper));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::inspect(
@@ -2887,7 +2436,7 @@ Observable* Observable::inspect(
       MakeGarbageCollected<OperatorInspectSubscribeDelegate>(
           this, next_callback, error_callback, complete_callback,
           subscribe_callback, abort_callback));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::catchImpl(ScriptState*,
@@ -2896,309 +2445,20 @@ Observable* Observable::catchImpl(ScriptState*,
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorCatchSubscribeDelegate>(this, callback));
-  return return_observable;
+  return PropagateSharedSources(return_observable);
 }
 
 Observable* Observable::finally(ScriptState*, V8VoidFunction* callback) {
   Observable* return_observable = MakeGarbageCollected<Observable>(
       GetExecutionContext(),
       MakeGarbageCollected<OperatorFinallySubscribeDelegate>(this, callback));
-  return return_observable;
-}
-
-namespace {
-
-// Creates and sets up a promise resolver used for the promise returned by
-// Observable methods, taking abort signals passed in options into account
-// and rejecting the promise as necessary.
-template <typename PromisedType>
-std::tuple<ScriptPromiseResolver<PromisedType>*,
-           AbortSignal::AlgorithmHandle*,
-           bool /*aborted=*/>
-CreatePromiseResolverForObservable(ScriptState* script_state,
-                                   SubscribeOptions* options) {
-  ScriptPromiseResolver<PromisedType>* resolver =
-      MakeGarbageCollected<ScriptPromiseResolver<PromisedType>>(script_state);
-  AbortSignal::AlgorithmHandle* algorithm_handle = nullptr;
-  if (options->hasSignal()) {
-    if (options->signal()->aborted()) [[unlikely]] {
-      resolver->Reject(options->signal()->reason(script_state));
-      return std::make_tuple(resolver, nullptr, true);
-    }
-    algorithm_handle = options->signal()->AddAlgorithm(
-        MakeGarbageCollected<RejectPromiseAbortAlgorithm>(resolver,
-                                                          options->signal()));
-  }
-  resolver->SuppressDetachCheck();
-  return std::make_tuple(resolver, algorithm_handle, false);
-}
-
-}  // namespace
-
-ScriptPromise<IDLSequence<IDLAny>> Observable::toArray(
-    ScriptState* script_state,
-    SubscribeOptions* options) {
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLSequence<IDLAny>>(script_state,
-                                                              options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  ToArrayInternalObserver* internal_observer =
-      MakeGarbageCollected<ToArrayInternalObserver>(resolver, algorithm_handle);
-
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLUndefined> Observable::forEach(ScriptState* script_state,
-                                                V8Visitor* callback,
-                                                SubscribeOptions* options) {
-  AbortController* visitor_callback_controller =
-      AbortController::Create(script_state);
-  HeapVector<Member<AbortSignal>> signals;
-  signals.push_back(visitor_callback_controller->signal());
-  if (options->hasSignal()) {
-    signals.push_back(options->signal());
-  }
-
-  // The internal observer associated with this operator must have the ability
-  // to unsubscribe from `this`. This is important in the internal observer's
-  // `next()` handler, which invokes `callback` with each passed-in value. If
-  // `callback` throws an error, we must unsubscribe from `this` and reject
-  // `promise`.
-  //
-  // This means we have to maintain a separate, internal `AbortController` that
-  // will abort the subscription in that case. Consequently, this means we have
-  // to subscribe with an internal `SubscribeOptions`, whose signal is always
-  // present, and is a composite signal derived from the aforementioned
-  // controller, and the given `options`'s signal, if present.
-  SubscribeOptions* internal_options = MakeGarbageCollected<SubscribeOptions>();
-  internal_options->setSignal(
-      MakeGarbageCollected<AbortSignal>(script_state, signals));
-
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLUndefined>(script_state,
-                                                       internal_options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorForEachInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorForEachInternalObserver>(
-          resolver, visitor_callback_controller, callback, algorithm_handle);
-
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    internal_options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLAny> Observable::first(ScriptState* script_state,
-                                        SubscribeOptions* options) {
-  AbortController* controller = AbortController::Create(script_state);
-  HeapVector<Member<AbortSignal>> signals;
-
-  // The internal observer associated with this operator must have the ability
-  // to unsubscribe from `this`. This happens in the internal observer's
-  // `next()` handler, when the first value is emitted.
-  //
-  // This means we have to maintain a separate, internal `AbortController` that
-  // will abort the subscription. Consequently, this means we have to subscribe
-  // with an internal `SubscribeOptions`, whose signal is always present, and is
-  // a composite signal derived from:
-  //   1. The aforementioned controller.
-  signals.push_back(controller->signal());
-  //   2. The given `options`'s signal, if present.
-  if (options->hasSignal()) {
-    signals.push_back(options->signal());
-  }
-
-  SubscribeOptions* internal_options = MakeGarbageCollected<SubscribeOptions>();
-  internal_options->setSignal(
-      MakeGarbageCollected<AbortSignal>(script_state, signals));
-
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLAny>(script_state,
-                                                 internal_options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorFirstInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorFirstInternalObserver>(resolver, controller,
-                                                          algorithm_handle);
-
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    internal_options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLAny> Observable::last(ScriptState* script_state,
-                                       SubscribeOptions* options) {
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLAny>(script_state, options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorLastInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorLastInternalObserver>(resolver,
-                                                         algorithm_handle);
-
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLBoolean> Observable::some(ScriptState* script_state,
-                                           V8Predicate* predicate,
-                                           SubscribeOptions* options) {
-  AbortController* controller = AbortController::Create(script_state);
-  HeapVector<Member<AbortSignal>> signals;
-  signals.push_back(controller->signal());
-  if (options->hasSignal()) {
-    signals.push_back(options->signal());
-  }
-
-  SubscribeOptions* internal_options = MakeGarbageCollected<SubscribeOptions>();
-  internal_options->setSignal(
-      MakeGarbageCollected<AbortSignal>(script_state, signals));
-
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLBoolean>(script_state,
-                                                     internal_options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorSomeInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorSomeInternalObserver>(
-          resolver, controller, predicate, algorithm_handle);
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    internal_options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLBoolean> Observable::every(ScriptState* script_state,
-                                            V8Predicate* predicate,
-                                            SubscribeOptions* options) {
-  AbortController* controller = AbortController::Create(script_state);
-  HeapVector<Member<AbortSignal>> signals;
-  signals.push_back(controller->signal());
-  if (options->hasSignal()) {
-    signals.push_back(options->signal());
-  }
-
-  SubscribeOptions* internal_options = MakeGarbageCollected<SubscribeOptions>();
-  internal_options->setSignal(
-      MakeGarbageCollected<AbortSignal>(script_state, signals));
-
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLBoolean>(script_state,
-                                                     internal_options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorEveryInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorEveryInternalObserver>(
-          resolver, controller, predicate, algorithm_handle);
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    internal_options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLAny> Observable::find(ScriptState* script_state,
-                                       V8Predicate* predicate,
-                                       SubscribeOptions* options) {
-  AbortController* controller = AbortController::Create(script_state);
-  HeapVector<Member<AbortSignal>> signals;
-  signals.push_back(controller->signal());
-  if (options->hasSignal()) {
-    signals.push_back(options->signal());
-  }
-
-  SubscribeOptions* internal_options = MakeGarbageCollected<SubscribeOptions>();
-  internal_options->setSignal(
-      MakeGarbageCollected<AbortSignal>(script_state, signals));
-
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLAny>(script_state,
-                                                 internal_options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorFindInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorFindInternalObserver>(
-          resolver, controller, predicate, algorithm_handle);
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    internal_options);
-
-  return resolver->Promise();
-}
-
-ScriptPromise<IDLAny> Observable::reduce(ScriptState* script_state,
-                                         V8Reducer* reducer) {
-  return ReduceInternal(script_state, reducer, std::nullopt,
-                        MakeGarbageCollected<SubscribeOptions>());
-}
-
-ScriptPromise<IDLAny> Observable::reduce(ScriptState* script_state,
-                                         V8Reducer* reducer,
-                                         v8::Local<v8::Value> initialValue,
-                                         SubscribeOptions* options) {
-  DCHECK(options);
-  return ReduceInternal(
-      script_state, reducer,
-      std::make_optional(ScriptValue(script_state->GetIsolate(), initialValue)),
-      options);
-}
-
-ScriptPromise<IDLAny> Observable::ReduceInternal(
-    ScriptState* script_state,
-    V8Reducer* reducer,
-    std::optional<ScriptValue> initial_value,
-    SubscribeOptions* options) {
-  AbortController* controller = AbortController::Create(script_state);
-  HeapVector<Member<AbortSignal>> signals;
-  signals.push_back(controller->signal());
-  if (options->hasSignal()) {
-    signals.push_back(options->signal());
-  }
-
-  SubscribeOptions* internal_options = MakeGarbageCollected<SubscribeOptions>();
-  internal_options->setSignal(
-      MakeGarbageCollected<AbortSignal>(script_state, signals));
-
-  auto [resolver, algorithm_handle, aborted] =
-      CreatePromiseResolverForObservable<IDLAny>(script_state,
-                                                 internal_options);
-  if (aborted) {
-    return resolver->Promise();
-  }
-
-  OperatorReduceInternalObserver* internal_observer =
-      MakeGarbageCollected<OperatorReduceInternalObserver>(
-          resolver, controller, reducer, initial_value, algorithm_handle);
-  SubscribeInternal(script_state, /*observer_union=*/nullptr, internal_observer,
-                    internal_options);
-
-  return resolver->Promise();
+  return PropagateSharedSources(return_observable);
 }
 
 void Observable::Trace(Visitor* visitor) const {
   visitor->Trace(subscribe_callback_);
   visitor->Trace(subscribe_delegate_);
-  visitor->Trace(weak_subscriber_);
+  visitor->Trace(shared_sources_);
 
   ScriptWrappable::Trace(visitor);
   ExecutionContextClient::Trace(visitor);

@@ -5,6 +5,8 @@
 #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_DOM_SUBSCRIBER_H_
 #define THIRD_PARTY_BLINK_RENDERER_CORE_DOM_SUBSCRIBER_H_
 
+#include <optional>
+
 #include "base/types/pass_key.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
 #include "third_party/blink/renderer/core/core_export.h"
@@ -18,10 +20,12 @@
 namespace blink {
 
 class AbortController;
-class ObservableInternalObserver;
+class ObservableSubscriptionObserver;
 class Observable;
 class ScriptState;
 class SubscribeOptions;
+class SharedObservable;
+class TerminationConfig;
 class V8VoidFunction;
 
 class CORE_EXPORT Subscriber final : public ScriptWrappable,
@@ -31,13 +35,14 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
  public:
   Subscriber(base::PassKey<Observable>,
              ScriptState*,
-             ObservableInternalObserver*,
-             SubscribeOptions*);
+             ObservableSubscriptionObserver*,
+             SubscribeOptions*,
+             SharedObservable* = nullptr);
 
   // API methods.
   void next(ScriptValue);
-  void complete(ScriptState*);
-  void error(ScriptState*, ScriptValue);
+  void complete(ScriptState*, const TerminationConfig* = nullptr);
+  void error(ScriptState*, ScriptValue, const TerminationConfig* = nullptr);
   void addTeardown(V8VoidFunction*);
 
   // API attributes.
@@ -45,9 +50,12 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   AbortSignal* signal() const;
 
   void RegisterNewObserver(ScriptState* script_state,
-                           ObservableInternalObserver*,
+                           ObservableSubscriptionObserver*,
                            SubscribeOptions*);
 
+  uint64_t ObserverCount() const { return internal_observers_.size(); }
+  void ReplayTo(ObservableSubscriptionObserver*,
+                const HeapVector<ScriptValue>&);
   void Trace(Visitor*) const override;
 
  private:
@@ -58,7 +66,7 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   // subscription first, this method does nothing because it is guarded by an
   // `active_` check.
   void ConsumerUnsubscribe(ScriptState* script_state,
-                           ObservableInternalObserver* associated_observer,
+                           ObservableSubscriptionObserver* associated_observer,
                            std::optional<ScriptValue> abort_reason);
 
   // This method is idempotent; it may be called more than once, re-entrantly,
@@ -76,11 +84,14 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   //      producer error is communicated through to `this`'s signal and any
   //      upstream signals.
   void CloseSubscription(ScriptState* script_state,
-                         std::optional<ScriptValue> abort_reason);
+                         std::optional<ScriptValue> abort_reason,
+                         bool terminal = false,
+                         bool is_error = false,
+                         bool close = false);
 
-  // The list of `ObservableInternalObserver`s which encapsulate algorithms to
-  // call when `this` produces values or actions that need to be pushed to the
-  // subscriber handlers.
+  // The list of `ObservableSubscriptionObserver`s which encapsulate algorithms
+  // to call when `this` produces values or actions that need to be pushed to
+  // the subscriber handlers.
   //
   // https://wicg.github.io/observable/#subscriber-next-algorithm:
   // "Each Subscriber has a next algorithm, which is a next steps-or-null."
@@ -91,7 +102,7 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   // https://wicg.github.io/observable/#subscriber-complete-algorithm:
   // "Each Subscriber has a complete algorithm, which is a complete
   // steps-or-null."
-  HeapVector<Member<ObservableInternalObserver>> internal_observers_;
+  HeapVector<Member<ObservableSubscriptionObserver>> internal_observers_;
   // This is a subset of `internal_observers_`; specifically, for each internal
   // observer that has an associated `AbortSignal`, we own the `AbortSignal`'s
   // algorithm handle in `consumer_abort_algorithms_` to keep the algorithm
@@ -99,7 +110,7 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   // `ConsumerAbortSubscription()` which observer it was associated, and we can
   // clear the algorithm's handle from `consumer_abort_algorithms_`, since it no
   // longer needs to be kept alive.
-  HeapHashMap<Member<ObservableInternalObserver>,
+  HeapHashMap<Member<ObservableSubscriptionObserver>,
               Member<AbortSignal::AlgorithmHandle>>
       consumer_abort_algorithms_;
 
@@ -108,6 +119,7 @@ class CORE_EXPORT Subscriber final : public ScriptWrappable,
   // are invoked) or once the subscriber unsubscribes by aborting the
   // `AbortSignal` that it passed into `Observable::subscribe()`.
   bool active_ = true;
+  Member<SharedObservable> shared_owner_;
 
   // `subscription_controller_` is aborted in two cases:
   //   1. Producer-initiated unsubscription: when `error()`/`complete()` are

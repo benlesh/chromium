@@ -11,6 +11,8 @@
     idl_test(["observable.tentative"], ["dom"], (idl_array) => {
       idl_array.add_objects({
         Observable: ["new Observable(() => {})"],
+        SharedObservable: ["new SharedObservable(() => {})"],
+        EventTarget: ["new EventTarget()"],
         Subscriber: [
           "(() => { let s = null; new Observable(_s => s = _s).subscribe({}); return s })()",
         ],

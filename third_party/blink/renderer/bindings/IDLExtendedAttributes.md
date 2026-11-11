@@ -1419,3 +1419,16 @@ THIS SOFTWARE IS PROVIDED BY APPLE INC. AND ITS CONTRIBUTORS “AS IS” AND ANY
 ***
 
 [CrossOriginProperties]: https://html.spec.whatwg.org/C/#crossoriginproperties-(-o-)
+
+### [SkipInInterfaceObjectPrototypeChain]
+
+Blink-only implementation attribute; not a standardized Web IDL extension.
+This no-argument attribute applies to interfaces. When constructing a derived
+interface's constructor, skip an annotated parent interface object and use the
+nearest unannotated ancestor, or Function.prototype if there is none. Instance
+prototype inheritance and initialization of the skipped parent are unchanged.
+
+WindowProperties uses this for HTML's named properties object. The experimental
+Observable draft uses it so SharedObservable instances inherit from Observable
+while the constructor does not inherit Observable.from. The draft still needs
+to resolve the corresponding Web IDL specification and idlharness behavior.
